@@ -4,8 +4,7 @@ services:
   portless-daemon:
     image: ${PORTLESS_CLIENT_IMAGE}
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     environment:
       PORTLESS_DEVICE_TOKEN: ${PORTLESS_DEVICE_TOKEN}
       PORTLESS_PMS_URL: ${PORTLESS_PMS_URL}
