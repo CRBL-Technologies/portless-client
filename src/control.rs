@@ -84,7 +84,7 @@ pub struct TrustBundle {
     pub generated_at: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeviceConfig {
     pub tunnel_id: String,
     pub subdomain: String,

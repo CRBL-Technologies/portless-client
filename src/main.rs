@@ -1,13 +1,13 @@
 mod config;
 mod control;
 mod state;
+mod tunnel;
 
 use anyhow::Result;
 use config::Config;
 use control::ControlClient;
 use state::DaemonState;
-use tokio::time;
-use tracing::{info, warn};
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,28 +39,17 @@ async fn main() -> Result<()> {
     );
 
     let mut state = DaemonState::load(&cfg.data_dir).await?;
-    state.tunnel_id = Some(device.tunnel_id);
-    state.subdomain = Some(device.subdomain);
+    state.tunnel_id = Some(device.tunnel_id.clone());
+    state.subdomain = Some(device.subdomain.clone());
     state.config_generation = Some(device.config_generation);
-    state.relay_address = Some(device.relay_address);
+    state.relay_address = Some(device.relay_address.clone());
     state.save(&cfg.data_dir).await?;
 
-    warn!("QUIC/mTLS tunnel is not implemented in this Phase 0 daemon skeleton");
-    wait_for_shutdown(cfg.keepalive_profile.interval()).await;
-    Ok(())
-}
-
-async fn wait_for_shutdown(interval: std::time::Duration) {
-    let mut tick = time::interval(interval);
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                info!("daemon skeleton heartbeat");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown signal received");
-                return;
-            }
+    tokio::select! {
+        result = tunnel::run(cfg, device) => result?,
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutdown signal received");
         }
     }
+    Ok(())
 }
