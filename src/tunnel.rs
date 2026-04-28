@@ -8,7 +8,7 @@ use reqwest::{
     Client, Method, Url,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time;
+use tokio::{sync::mpsc, time};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
@@ -41,64 +41,92 @@ async fn run_once(cfg: &Config, http: &Client, relay_url: Url) -> Result<()> {
             .context("build relay authorization header")?,
     );
 
-    let (mut socket, _) = connect_async(request)
+    let (socket, _) = connect_async(request)
         .await
         .with_context(|| format!("connect relay websocket {relay_url}"))?;
     info!(relay = %relay_url, "relay tunnel connected");
 
-    while let Some(message) = socket.next().await {
-        match message.context("read relay websocket frame")? {
-            Message::Text(raw) => {
-                let RelayFrame::Request { request } =
-                    serde_json::from_str(&raw).context("decode relay request")?;
-                let response = forward_request(http, &cfg.pms_url, request).await;
-                let raw = serde_json::to_string(&DaemonFrame::Response { response })
-                    .context("encode relay response")?;
-                socket
-                    .send(Message::Text(raw))
-                    .await
-                    .context("send relay response")?;
-            }
-            Message::Ping(payload) => {
-                socket
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("send websocket pong")?;
-            }
-            Message::Close(_) => return Ok(()),
-            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(64);
+    let writer = async move {
+        while let Some(frame) = out_rx.recv().await {
+            let message = match frame {
+                OutboundFrame::Daemon(frame) => {
+                    let raw = serde_json::to_string(&frame).context("encode relay response")?;
+                    Message::Text(raw)
+                }
+                OutboundFrame::Pong(payload) => Message::Pong(payload),
+            };
+            ws_tx
+                .send(message)
+                .await
+                .context("send relay websocket frame")?;
         }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let pms_url = cfg.pms_url.clone();
+    let http = http.clone();
+    let reader = async move {
+        while let Some(message) = ws_rx.next().await {
+            match message.context("read relay websocket frame")? {
+                Message::Text(raw) => {
+                    let RelayFrame::Request { request } =
+                        serde_json::from_str(&raw).context("decode relay request")?;
+                    let http = http.clone();
+                    let pms_url = pms_url.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        forward_request(http, pms_url, request, out_tx).await;
+                    });
+                }
+                Message::Ping(payload) => {
+                    out_tx
+                        .send(OutboundFrame::Pong(payload))
+                        .await
+                        .context("queue websocket pong")?;
+                }
+                Message::Close(_) => return Ok(()),
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = writer => result,
+        result = reader => result,
     }
-    Ok(())
 }
 
-async fn forward_request(http: &Client, pms_url: &Url, request: TunnelRequest) -> TunnelResponse {
-    match forward_request_inner(http, pms_url, &request).await {
-        Ok(mut response) => {
-            response.id = request.id;
-            response
+async fn forward_request(
+    http: Client,
+    pms_url: Url,
+    request: TunnelRequest,
+    out_tx: mpsc::Sender<OutboundFrame>,
+) {
+    let request_id = request.id.clone();
+    match send_local_request(&http, &pms_url, &request).await {
+        Ok(response) => {
+            if let Err(err) = stream_local_response(request_id.clone(), response, out_tx).await {
+                warn!(request_id = %request_id, error = %err, "stream relay response failed");
+            }
         }
-        Err(err) => TunnelResponse {
-            id: request.id,
-            status: 502,
-            headers: vec![HeaderPair {
-                name: header::CONTENT_TYPE.as_str().to_owned(),
-                value: "text/plain; charset=utf-8".to_owned(),
-            }],
-            body_base64: BASE64.encode(err.to_string()),
-        },
+        Err(err) => {
+            if let Err(send_err) = send_error_response(request_id.clone(), err, out_tx).await {
+                warn!(request_id = %request_id, error = %send_err, "send relay error response failed");
+            }
+        }
     }
 }
 
-async fn forward_request_inner(
+async fn send_local_request(
     http: &Client,
     pms_url: &Url,
     request: &TunnelRequest,
-) -> Result<TunnelResponse> {
+) -> Result<reqwest::Response> {
     let method = Method::from_bytes(request.method.as_bytes()).context("parse request method")?;
-    let target = pms_url
-        .join(&request.path_query)
-        .context("build local PMS request URL")?;
+    let target = pms_target_url(pms_url, &request.path_query)?;
     let body = BASE64
         .decode(&request.body_base64)
         .context("decode request body")?;
@@ -111,21 +139,103 @@ async fn forward_request_inner(
         let value = HeaderValue::from_str(&header.value).context("parse header value")?;
         builder = builder.header(name, value);
     }
-    let response = builder
+    builder
         .body(body)
         .send()
         .await
-        .context("send local PMS request")?;
+        .context("send local PMS request")
+}
+
+async fn stream_local_response(
+    request_id: String,
+    response: reqwest::Response,
+    out_tx: mpsc::Sender<OutboundFrame>,
+) -> Result<()> {
     let status = response.status().as_u16();
     let headers = serializable_headers(response.headers());
-    let body = response.bytes().await.context("read local PMS response")?;
+    out_tx
+        .send(OutboundFrame::Daemon(DaemonFrame::ResponseStart {
+            response: TunnelResponseHead {
+                id: request_id.clone(),
+                status,
+                headers,
+            },
+        }))
+        .await
+        .context("queue response head")?;
 
-    Ok(TunnelResponse {
-        id: String::new(),
-        status,
-        headers,
-        body_base64: BASE64.encode(body),
-    })
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.context("read local PMS response chunk")?;
+        out_tx
+            .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
+                id: request_id.clone(),
+                chunk_base64: BASE64.encode(chunk),
+                end: false,
+            }))
+            .await
+            .context("queue response body chunk")?;
+    }
+    out_tx
+        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
+            id: request_id,
+            chunk_base64: String::new(),
+            end: true,
+        }))
+        .await
+        .context("queue response body end")?;
+    Ok(())
+}
+
+async fn send_error_response(
+    request_id: String,
+    err: anyhow::Error,
+    out_tx: mpsc::Sender<OutboundFrame>,
+) -> Result<()> {
+    out_tx
+        .send(OutboundFrame::Daemon(DaemonFrame::ResponseStart {
+            response: TunnelResponseHead {
+                id: request_id.clone(),
+                status: 502,
+                headers: vec![HeaderPair {
+                    name: header::CONTENT_TYPE.as_str().to_owned(),
+                    value: "text/plain; charset=utf-8".to_owned(),
+                }],
+            },
+        }))
+        .await
+        .context("queue error response head")?;
+    out_tx
+        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
+            id: request_id.clone(),
+            chunk_base64: BASE64.encode(err.to_string()),
+            end: false,
+        }))
+        .await
+        .context("queue error response body")?;
+    out_tx
+        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
+            id: request_id,
+            chunk_base64: String::new(),
+            end: true,
+        }))
+        .await
+        .context("queue error response end")?;
+    Ok(())
+}
+
+fn pms_target_url(pms_url: &Url, path_query: &str) -> Result<Url> {
+    let mut base = pms_url.clone();
+    base.set_path("");
+    base.set_query(None);
+    base.set_fragment(None);
+    let prefix = base.as_str().trim_end_matches('/');
+    let suffix = if path_query.starts_with('/') {
+        path_query.to_owned()
+    } else {
+        format!("/{path_query}")
+    };
+    Url::parse(&format!("{prefix}{suffix}")).context("build local PMS request URL")
 }
 
 fn relay_websocket_url(relay_address: &str) -> Result<Url> {
@@ -199,7 +309,14 @@ enum RelayFrame {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DaemonFrame {
-    Response { response: TunnelResponse },
+    ResponseStart {
+        response: TunnelResponseHead,
+    },
+    ResponseBody {
+        id: String,
+        chunk_base64: String,
+        end: bool,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,17 +329,21 @@ struct TunnelRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct TunnelResponse {
+struct TunnelResponseHead {
     id: String,
     status: u16,
     headers: Vec<HeaderPair>,
-    body_base64: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct HeaderPair {
     name: String,
     value: String,
+}
+
+enum OutboundFrame {
+    Daemon(DaemonFrame),
+    Pong(Vec<u8>),
 }
 
 #[cfg(test)]
@@ -248,6 +369,32 @@ mod tests {
         let got = relay_websocket_url("https://relay.example.com/foo?bar").unwrap();
 
         assert_eq!(got.as_str(), "wss://relay.example.com/_portless/connect");
+    }
+
+    #[test]
+    fn builds_pms_url_with_path_and_query() {
+        let pms_url = Url::parse("http://127.0.0.1:32400").unwrap();
+        let got = pms_target_url(
+            &pms_url,
+            "/video/:/transcode/universal/start.m3u8?X-Plex-Token=abc",
+        )
+        .unwrap();
+
+        assert_eq!(
+            got.as_str(),
+            "http://127.0.0.1:32400/video/:/transcode/universal/start.m3u8?X-Plex-Token=abc"
+        );
+    }
+
+    #[test]
+    fn builds_pms_url_with_colon_prefixed_path() {
+        let pms_url = Url::parse("http://127.0.0.1:32400").unwrap();
+        let got = pms_target_url(&pms_url, ":/websockets/notifications?X-Plex-Token=abc").unwrap();
+
+        assert_eq!(
+            got.as_str(),
+            "http://127.0.0.1:32400/:/websockets/notifications?X-Plex-Token=abc"
+        );
     }
 
     #[test]
