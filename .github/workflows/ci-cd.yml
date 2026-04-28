@@ -159,3 +159,12 @@ jobs:
             -H "Content-Type: application/json" \
             -d @"$PAYLOAD_FILE" \
             "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${PORTAINER_ENDPOINT_ID}"
+
+          UPDATED_FILE="$(curl -sf --max-time 30 \
+            "${AUTH_HEADERS[@]}" \
+            "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${PORTAINER_ENDPOINT_ID}" |
+            jq -r '.StackFileContent')"
+          if [ "$UPDATED_FILE" != "$STACK_FILE" ]; then
+            echo "::error title=Portainer deploy verification failed::Stored stack file does not match repository compose file"
+            exit 1
+          fi
