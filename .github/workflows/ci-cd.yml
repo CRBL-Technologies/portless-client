@@ -160,11 +160,19 @@ jobs:
             -d @"$PAYLOAD_FILE" \
             "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${PORTAINER_ENDPOINT_ID}"
 
-          UPDATED_FILE="$(curl -sf --max-time 30 \
-            "${AUTH_HEADERS[@]}" \
-            "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${PORTAINER_ENDPOINT_ID}" |
-            jq -r '.StackFileContent')"
-          if [ "$UPDATED_FILE" != "$STACK_FILE" ]; then
+          verified=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            UPDATED_FILE="$(curl -sf --max-time 30 \
+              "${AUTH_HEADERS[@]}" \
+              "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${PORTAINER_ENDPOINT_ID}" |
+              jq -r '.StackFileContent')"
+            if [ "$UPDATED_FILE" = "$STACK_FILE" ]; then
+              verified=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$verified" -ne 1 ]; then
             echo "::error title=Portainer deploy verification failed::Stored stack file does not match repository compose file"
             exit 1
           fi
