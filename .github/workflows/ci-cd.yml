@@ -126,8 +126,11 @@ jobs:
             --arg image "ghcr.io/${repo_lc}:dev" \
             'map(select(.name != "PORTLESS_CLIENT_IMAGE")) +
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image}]')"
-          PAYLOAD="$(jq -n --arg file "$STACK_FILE" --argjson env "$ENV_JSON" \
-            '{StackFileContent: $file, Env: $env, pullImage: false}')"
+          ENV_FILE="$(mktemp)"
+          PAYLOAD_FILE="$(mktemp)"
+          printf '%s' "$ENV_JSON" > "$ENV_FILE"
+          jq -n --arg file "$STACK_FILE" --slurpfile env "$ENV_FILE" \
+            '{StackFileContent: $file, Env: $env[0], pullImage: false}' > "$PAYLOAD_FILE"
 
           urlencode() {
             jq -rn --arg value "$1" '$value | @uri'
@@ -151,8 +154,8 @@ jobs:
           curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
             "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
           pull_image "ghcr.io/${repo_lc}:dev"
-          echo "$PAYLOAD" | curl -sf --max-time 180 -X PUT \
+          curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
-            -d @- \
+            -d @"$PAYLOAD_FILE" \
             "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${PORTAINER_ENDPOINT_ID}"
