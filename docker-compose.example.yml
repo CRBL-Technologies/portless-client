@@ -1,0 +1,19 @@
+services:
+  portless-daemon:
+    build: .
+    env_file: .env.example
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - portless-data:/var/lib/portless
+    depends_on:
+      plex:
+        condition: service_started
+
+  plex:
+    image: nginx:1.27-alpine
+    expose:
+      - "80"
+
+volumes:
+  portless-data:

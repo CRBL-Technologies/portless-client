@@ -1,0 +1,18 @@
+# Portless client staging stack for the Umbrel/client Portainer environment.
+
+services:
+  portless-daemon:
+    image: ${PORTLESS_CLIENT_IMAGE}
+    restart: unless-stopped
+    environment:
+      PORTLESS_DEVICE_TOKEN: ${PORTLESS_DEVICE_TOKEN}
+      PORTLESS_PMS_URL: ${PORTLESS_PMS_URL}
+      PORTLESS_CONTROL_URL: ${PORTLESS_CONTROL_URL}
+      PORTLESS_DATA_DIR: /var/lib/portless
+      PORTLESS_KEEPALIVE_PROFILE: ${PORTLESS_KEEPALIVE_PROFILE:-residential}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - portless-daemon-data:/var/lib/portless
+
+volumes:
+  portless-daemon-data:
