@@ -151,9 +151,28 @@ jobs:
               "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
           }
 
+          remove_compose_services() {
+            project="$1"
+            shift
+            services_json="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
+            filters="$(jq -nc --arg project "$project" '{label:["com.docker.compose.project=\($project)"]}')"
+            curl -sf --max-time 30 \
+              "${AUTH_HEADERS[@]}" \
+              "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/json?all=true&filters=$(urlencode "$filters")" |
+              jq -r --argjson services "$services_json" \
+                '.[] | select((.Labels["com.docker.compose.service"] as $svc | $services | index($svc)) != null) | .Id' |
+              while read -r container_id; do
+                [ -n "$container_id" ] || continue
+                curl -sf --max-time 60 -X DELETE \
+                  "${AUTH_HEADERS[@]}" \
+                  "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/${container_id}?force=true&v=false"
+              done
+          }
+
           curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
             "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
           pull_image "ghcr.io/${repo_lc}:dev"
+          remove_compose_services "portless-client-dev" "portless-daemon"
           curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
