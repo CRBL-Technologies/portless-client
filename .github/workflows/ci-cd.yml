@@ -82,6 +82,9 @@ jobs:
     needs: docker
     if: github.ref_name == 'dev'
     environment: staging
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,10 +99,12 @@ jobs:
           PORTAINER_STACK_ID: ${{ secrets.PORTLESS_CLIENT_STACK_ID }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           missing=0
-          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_ENDPOINT_ID PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET; do
+          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_ENDPOINT_ID PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
             if [ -z "${!name:-}" ]; then
               echo "::notice title=Deploy skipped::Missing ${name}"
               missing=1
@@ -122,10 +127,30 @@ jobs:
             'map(select(.name != "PORTLESS_CLIENT_IMAGE")) +
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image}]')"
           PAYLOAD="$(jq -n --arg file "$STACK_FILE" --argjson env "$ENV_JSON" \
-            '{StackFileContent: $file, Env: $env, pullImage: true}')"
+            '{StackFileContent: $file, Env: $env, pullImage: false}')"
+
+          urlencode() {
+            jq -rn --arg value "$1" '$value | @uri'
+          }
+
+          pull_image() {
+            image="$1"
+            repo="${image%:*}"
+            tag="${image##*:}"
+            registry_auth="$(jq -nc \
+              --arg username "$GHCR_USERNAME" \
+              --arg password "$GHCR_TOKEN" \
+              '{"username":$username,"password":$password,"serveraddress":"ghcr.io"}' | base64 -w0)"
+            curl -sf --max-time 300 -X POST \
+              "${AUTH_HEADERS[@]}" \
+              -H "X-Registry-Auth: ${registry_auth}" \
+              -o /tmp/portless-image-pull.log \
+              "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
+          }
 
           curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
             "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
+          pull_image "ghcr.io/${repo_lc}:dev"
           echo "$PAYLOAD" | curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
