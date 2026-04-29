@@ -349,16 +349,16 @@ async fn stream_local_response(
         headers: serializable_response_headers(response.headers(), allow_upgrade_headers),
     };
     if let Err(err) = write_json_frame(send, &head).await {
-        log_daemon_transfer(
-            &request_id,
-            &method,
-            "http",
+        log_daemon_transfer(DaemonTransferLog {
+            request_id: &request_id,
+            method: &method,
+            kind: "http",
             status,
-            0,
-            0,
+            request_bytes: 0,
+            response_bytes: 0,
             started,
-            "write_head_failed",
-        );
+            outcome: "write_head_failed",
+        });
         return Err(err).context("write response head");
     }
 
@@ -368,57 +368,57 @@ async fn stream_local_response(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(err) => {
-                log_daemon_transfer(
-                    &request_id,
-                    &method,
-                    "http",
+                log_daemon_transfer(DaemonTransferLog {
+                    request_id: &request_id,
+                    method: &method,
+                    kind: "http",
                     status,
-                    0,
+                    request_bytes: 0,
                     response_bytes,
                     started,
-                    "pms_read_failed",
-                );
+                    outcome: "pms_read_failed",
+                });
                 return Err(err).context("read local PMS response chunk");
             }
         };
         response_bytes = response_bytes.saturating_add(chunk.len() as u64);
         if let Err(err) = send.write_all(&chunk).await {
-            log_daemon_transfer(
-                &request_id,
-                &method,
-                "http",
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request_id,
+                method: &method,
+                kind: "http",
                 status,
-                0,
+                request_bytes: 0,
                 response_bytes,
                 started,
-                "quic_write_failed",
-            );
+                outcome: "quic_write_failed",
+            });
             return Err(err).context("write response body chunk");
         }
     }
     if let Err(err) = send.finish() {
-        log_daemon_transfer(
-            &request_id,
-            &method,
-            "http",
+        log_daemon_transfer(DaemonTransferLog {
+            request_id: &request_id,
+            method: &method,
+            kind: "http",
             status,
-            0,
+            request_bytes: 0,
             response_bytes,
             started,
-            "finish_failed",
-        );
+            outcome: "finish_failed",
+        });
         return Err(err).context("finish response stream");
     }
-    log_daemon_transfer(
-        &request_id,
-        &method,
-        "http",
+    log_daemon_transfer(DaemonTransferLog {
+        request_id: &request_id,
+        method: &method,
+        kind: "http",
         status,
-        0,
+        request_bytes: 0,
         response_bytes,
         started,
-        "ok",
-    );
+        outcome: "ok",
+    });
     Ok(())
 }
 
@@ -437,32 +437,32 @@ async fn stream_local_upgrade_response(
         headers: serializable_response_headers(response.headers(), true),
     };
     if let Err(err) = write_json_frame(&mut send, &head).await {
-        log_daemon_transfer(
-            &request_id,
-            &method,
-            "upgrade",
+        log_daemon_transfer(DaemonTransferLog {
+            request_id: &request_id,
+            method: &method,
+            kind: "upgrade",
             status,
-            0,
-            0,
+            request_bytes: 0,
+            response_bytes: 0,
             started,
-            "write_head_failed",
-        );
+            outcome: "write_head_failed",
+        });
         return Err(err).context("write upgrade response head");
     }
 
     let upgraded = match response.upgrade().await {
         Ok(upgraded) => upgraded,
         Err(err) => {
-            log_daemon_transfer(
-                &request_id,
-                &method,
-                "upgrade",
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request_id,
+                method: &method,
+                kind: "upgrade",
                 status,
-                0,
-                0,
+                request_bytes: 0,
+                response_bytes: 0,
                 started,
-                "pms_upgrade_failed",
-            );
+                outcome: "pms_upgrade_failed",
+            });
             return Err(err).context("upgrade local PMS response");
         }
     };
@@ -493,28 +493,28 @@ async fn stream_local_upgrade_response(
 
     match tokio::try_join!(relay_to_pms, pms_to_relay) {
         Ok((request_bytes, response_bytes)) => {
-            log_daemon_transfer(
-                &request_id,
-                &method,
-                "upgrade",
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request_id,
+                method: &method,
+                kind: "upgrade",
                 status,
                 request_bytes,
                 response_bytes,
                 started,
-                "ok",
-            );
+                outcome: "ok",
+            });
         }
         Err(err) => {
-            log_daemon_transfer(
-                &request_id,
-                &method,
-                "upgrade",
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request_id,
+                method: &method,
+                kind: "upgrade",
                 status,
-                0,
-                0,
+                request_bytes: 0,
+                response_bytes: 0,
                 started,
-                "copy_failed",
-            );
+                outcome: "copy_failed",
+            });
             return Err(err);
         }
     }
@@ -620,27 +620,29 @@ fn bytes_per_second(bytes: u64, duration_ms: u64) -> u64 {
     bytes.saturating_mul(1000) / duration_ms
 }
 
-fn log_daemon_transfer(
-    request_id: &str,
-    method: &str,
+struct DaemonTransferLog<'a> {
+    request_id: &'a str,
+    method: &'a str,
     kind: &'static str,
     status: u16,
     request_bytes: u64,
     response_bytes: u64,
     started: time::Instant,
     outcome: &'static str,
-) {
-    let duration_ms = started.elapsed().as_millis() as u64;
+}
+
+fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
+    let duration_ms = event.started.elapsed().as_millis() as u64;
     info!(
-        request_id,
-        method,
-        kind,
-        status,
-        request_bytes,
-        response_bytes,
+        request_id = event.request_id,
+        method = event.method,
+        kind = event.kind,
+        status = event.status,
+        request_bytes = event.request_bytes,
+        response_bytes = event.response_bytes,
         duration_ms,
-        response_bytes_per_sec = bytes_per_second(response_bytes, duration_ms),
-        outcome,
+        response_bytes_per_sec = bytes_per_second(event.response_bytes, duration_ms),
+        outcome = event.outcome,
         "daemon transfer finished"
     );
 }
