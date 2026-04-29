@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -39,6 +39,7 @@ use crate::{
 const ALPN: &[u8] = b"portless-quic-v1";
 const MAX_FRAME_HEAD: usize = 128 * 1024;
 const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
+const STREAM_CANCELLED: VarInt = VarInt::from_u32(0x100);
 
 pub struct TunnelIdentity {
     ca_pem: String,
@@ -312,6 +313,7 @@ fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
                         break;
                     }
                     if tx.send(Ok(buf[..read].to_vec())).await.is_err() {
+                        let _ = recv.stop(STREAM_CANCELLED);
                         break;
                     }
                 }
