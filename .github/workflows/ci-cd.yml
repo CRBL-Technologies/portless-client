@@ -199,15 +199,30 @@ jobs:
           STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTAINER_STACK_ID}")"
           ENV_JSON="$(echo "$STACK_RESP" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
           repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          current_env_value() {
+            name="$1"
+            echo "$ENV_JSON" | jq -r --arg name "$name" '.[]? | select(.name == $name) | .value' | tail -n 1
+          }
+
+          if [ "$DAEMON_CHANGED" = "true" ]; then
+            CLIENT_IMAGE="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
+          else
+            CLIENT_IMAGE="$(current_env_value PORTLESS_CLIENT_IMAGE)"
+            if [ -z "$CLIENT_IMAGE" ] || [ "$CLIENT_IMAGE" = "null" ]; then
+              CLIENT_IMAGE="ghcr.io/${repo_lc}:dev"
+            fi
+          fi
+
           ENV_JSON="$(echo "$ENV_JSON" | jq -c \
-            --arg image "ghcr.io/${repo_lc}:dev" \
+            --arg image "$CLIENT_IMAGE" \
             'map(select(.name != "PORTLESS_CLIENT_IMAGE")) +
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image}]')"
           ENV_FILE="$(mktemp)"
           PAYLOAD_FILE="$(mktemp)"
           printf '%s' "$ENV_JSON" > "$ENV_FILE"
           jq -n --arg file "$STACK_FILE" --slurpfile env "$ENV_FILE" \
-            '{StackFileContent: $file, Env: $env[0], pullImage: false}' > "$PAYLOAD_FILE"
+            '{StackFileContent: $file, Env: $env[0], pullImage: true}' > "$PAYLOAD_FILE"
 
           urlencode() {
             jq -rn --arg value "$1" '$value | @uri'
@@ -233,26 +248,32 @@ jobs:
             shift
             services_json="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
             filters="$(jq -nc --arg project "$project" '{label:["com.docker.compose.project=\($project)"]}')"
-            curl -sf --max-time 30 \
+            container_ids="$(curl -sf --max-time 30 \
               "${AUTH_HEADERS[@]}" \
               "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/json?all=true&filters=$(urlencode "$filters")" |
               jq -r --argjson services "$services_json" \
-                '.[] | select((.Labels["com.docker.compose.service"] as $svc | $services | index($svc)) != null) | .Id' |
-              while read -r container_id; do
-                [ -n "$container_id" ] || continue
-                curl -sf --max-time 60 -X DELETE \
-                  "${AUTH_HEADERS[@]}" \
-                  "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/${container_id}?force=true&v=false"
-              done
+                '.[] | select((.Labels["com.docker.compose.service"] as $svc | $services | index($svc)) != null) | .Id')"
+            if [ -z "$container_ids" ]; then
+              echo "::warning title=Portainer recycle skipped::No existing containers matched project ${project} and services ${services_json}"
+              return 0
+            fi
+            while read -r container_id; do
+              [ -n "$container_id" ] || continue
+              curl -sf --max-time 60 -X DELETE \
+                "${AUTH_HEADERS[@]}" \
+                "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/${container_id}?force=true&v=false"
+            done <<< "$container_ids"
           }
 
           curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
             "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
           if [ "$DAEMON_CHANGED" = "true" ]; then
-            pull_image "ghcr.io/${repo_lc}:dev"
+            pull_image "$CLIENT_IMAGE"
           fi
           if [ "$DAEMON_CHANGED" = "true" ] || [ "$DEPLOY_CONFIG_CHANGED" = "true" ]; then
-            remove_compose_services "portless-client-dev" "portless-daemon"
+            compose_project="$(echo "$STACK_RESP" | jq -r '.Name // empty')"
+            [ -n "$compose_project" ] && [ "$compose_project" != "null" ] || compose_project="portless-client-dev"
+            remove_compose_services "$compose_project" "portless-daemon"
           fi
           curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
