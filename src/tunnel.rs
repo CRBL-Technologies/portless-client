@@ -667,7 +667,7 @@ impl RedirectRewrite {
     fn location(&self, raw: &str) -> Option<String> {
         let mut location = Url::parse(raw).ok()?;
         if !same_url_origin(&location, &self.pms_origin)
-            && !same_url_host_port(&location, &self.public_origin)
+            && !same_url_hostname(&location, &self.public_origin)
         {
             return None;
         }
@@ -689,9 +689,14 @@ fn same_url_origin(left: &Url, right: &Url) -> bool {
     left.scheme() == right.scheme() && same_url_host_port(left, right)
 }
 
+fn same_url_hostname(left: &Url, right: &Url) -> bool {
+    left.host_str()
+        .zip(right.host_str())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
 fn same_url_host_port(left: &Url, right: &Url) -> bool {
-    left.host_str() == right.host_str()
-        && left.port_or_known_default() == right.port_or_known_default()
+    same_url_hostname(left, right) && left.port_or_known_default() == right.port_or_known_default()
 }
 
 async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
@@ -1075,6 +1080,31 @@ mod tests {
 
         let got = rewrite
             .location("http://127.0.0.1:32400/web/index.html")
+            .unwrap();
+
+        assert_eq!(got, "https://antoine.staging.portless.io/web/index.html");
+    }
+
+    #[test]
+    fn rewrites_public_host_redirects_to_public_scheme() {
+        let pms_url = Url::parse("http://127.0.0.1:32400").unwrap();
+        let rewrite = RedirectRewrite::from_request(
+            &pms_url,
+            &[
+                HeaderPair {
+                    name: "host".to_owned(),
+                    value: "antoine.staging.portless.io".to_owned(),
+                },
+                HeaderPair {
+                    name: "x-forwarded-proto".to_owned(),
+                    value: "https".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let got = rewrite
+            .location("http://antoine.staging.portless.io/web/index.html")
             .unwrap();
 
         assert_eq!(got, "https://antoine.staging.portless.io/web/index.html");
