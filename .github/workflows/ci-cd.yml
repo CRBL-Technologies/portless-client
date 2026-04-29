@@ -11,6 +11,76 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect Image Changes
+    runs-on: ubuntu-latest
+    outputs:
+      daemon: ${{ steps.filter.outputs.daemon }}
+      deploy_config: ${{ steps.filter.outputs.deploy_config }}
+      deploy: ${{ steps.filter.outputs.deploy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect changed image inputs
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "daemon=${daemon}" >> "$GITHUB_OUTPUT"
+            echo "deploy_config=${deploy_config}" >> "$GITHUB_OUTPUT"
+            if [ "$daemon" = "true" ] || [ "$deploy_config" = "true" ]; then
+              echo "deploy=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          daemon=false
+          deploy_config=false
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            daemon=true
+            deploy_config=true
+            emit
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$BEFORE_SHA"
+            head="$HEAD_SHA"
+            if [ -z "$base" ] || echo "$base" | grep -Eq '^0+$'; then
+              base="$(git rev-list --max-parents=0 "$head")"
+            fi
+          fi
+
+          git diff --name-only "$base" "$head" > /tmp/changed-files
+          while IFS= read -r file; do
+            case "$file" in
+              .github/workflows/ci-cd.yml|.dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
+                daemon=true
+                ;;
+              docker-compose.portainer.yml)
+                deploy_config=true
+                ;;
+            esac
+          done < /tmp/changed-files
+
+          emit
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -37,8 +107,8 @@ jobs:
   docker:
     name: Build Daemon Image
     runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [test, changes]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.daemon == 'true'
     permissions:
       contents: read
       packages: write
@@ -79,8 +149,13 @@ jobs:
   deploy:
     name: Deploy Dev
     runs-on: ubuntu-latest
-    needs: docker
-    if: github.ref_name == 'dev'
+    needs: [test, changes, docker]
+    if: >-
+      always() &&
+      github.ref_name == 'dev' &&
+      needs.test.result == 'success' &&
+      needs.changes.outputs.deploy == 'true' &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped')
     environment: staging
     permissions:
       contents: read
@@ -101,6 +176,8 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
+          DAEMON_CHANGED: ${{ needs.changes.outputs.daemon }}
+          DEPLOY_CONFIG_CHANGED: ${{ needs.changes.outputs.deploy_config }}
         run: |
           set -euo pipefail
           missing=0
@@ -171,8 +248,12 @@ jobs:
 
           curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
             "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
-          pull_image "ghcr.io/${repo_lc}:dev"
-          remove_compose_services "portless-client-dev" "portless-daemon"
+          if [ "$DAEMON_CHANGED" = "true" ]; then
+            pull_image "ghcr.io/${repo_lc}:dev"
+          fi
+          if [ "$DAEMON_CHANGED" = "true" ] || [ "$DEPLOY_CONFIG_CHANGED" = "true" ]; then
+            remove_compose_services "portless-client-dev" "portless-daemon"
+          fi
           curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
