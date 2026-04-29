@@ -519,6 +519,7 @@ fn reconnect_jitter(attempt: u32, base: Duration) -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
+#[cfg(test)]
 fn serializable_headers(headers: &HeaderMap) -> Vec<HeaderPair> {
     headers
         .iter()
