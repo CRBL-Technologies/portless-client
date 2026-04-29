@@ -39,6 +39,9 @@ use crate::{
 const ALPN: &[u8] = b"portless-quic-v1";
 const MAX_FRAME_HEAD: usize = 128 * 1024;
 const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
+const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+const SEND_WINDOW: u64 = 32 * 1024 * 1024;
 const STREAM_CANCELLED: VarInt = VarInt::from_u32(0x100);
 
 pub struct TunnelIdentity {
@@ -542,7 +545,7 @@ fn serializable_response_headers(
     headers
         .iter()
         .filter_map(|(name, value)| {
-            if !allow_upgrade_headers && is_hop_by_hop(name) {
+            if !allow_upgrade_headers && is_hop_by_hop_response(name) {
                 return None;
             }
             Some(HeaderPair {
@@ -551,6 +554,20 @@ fn serializable_response_headers(
             })
         })
         .collect()
+}
+
+fn is_hop_by_hop_response(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -581,10 +598,22 @@ fn quic_client_config(identity: &TunnelIdentity) -> Result<quinn::ClientConfig> 
         .with_client_auth_cert(certs, key)
         .context("build daemon TLS client config")?;
     client_crypto.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
             .context("build QUIC rustls client config")?,
-    )))
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(0_u8.into());
+    transport.max_concurrent_bidi_streams(128_u32.into());
+    transport.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
+    transport.receive_window(CONNECTION_RECEIVE_WINDOW.into());
+    transport.send_window(SEND_WINDOW);
+    transport.datagram_receive_buffer_size(None);
+    transport.datagram_send_buffer_size(0);
+    transport.keep_alive_interval(Some(Duration::from_secs(20)));
+    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
 }
 
 fn parse_certs_pem(raw: &str) -> Result<Vec<CertificateDer<'static>>> {
