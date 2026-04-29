@@ -181,7 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_ENDPOINT_ID PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
+          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
             if [ -z "${!name:-}" ]; then
               echo "::notice title=Deploy skipped::Missing ${name}"
               missing=1
@@ -197,6 +197,14 @@ jobs:
 
           STACK_FILE="$(cat docker-compose.portainer.yml)"
           STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTAINER_STACK_ID}")"
+          STACK_ENDPOINT_ID="$(echo "$STACK_RESP" | jq -r '.EndpointId // empty')"
+          if [ -z "$STACK_ENDPOINT_ID" ]; then
+            STACK_ENDPOINT_ID="${PORTAINER_ENDPOINT_ID:-}"
+          fi
+          if [ -z "$STACK_ENDPOINT_ID" ]; then
+            echo "::error title=Portainer endpoint missing::Stack ${PORTAINER_STACK_ID} did not include EndpointId"
+            exit 1
+          fi
           ENV_JSON="$(echo "$STACK_RESP" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
           repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
 
@@ -240,52 +248,38 @@ jobs:
               "${AUTH_HEADERS[@]}" \
               -H "X-Registry-Auth: ${registry_auth}" \
               -o /tmp/portless-image-pull.log \
-              "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
+              "$API/endpoints/${STACK_ENDPOINT_ID}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
           }
 
-          remove_compose_services() {
-            project="$1"
-            shift
-            services_json="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
-            filters="$(jq -nc --arg project "$project" '{label:["com.docker.compose.project=\($project)"]}')"
-            container_ids="$(curl -sf --max-time 30 \
-              "${AUTH_HEADERS[@]}" \
-              "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/json?all=true&filters=$(urlencode "$filters")" |
-              jq -r --argjson services "$services_json" \
-                '.[] | select((.Labels["com.docker.compose.service"] as $svc | $services | index($svc)) != null) | .Id')"
-            if [ -z "$container_ids" ]; then
-              echo "::warning title=Portainer recycle skipped::No existing containers matched project ${project} and services ${services_json}"
-              return 0
+          endpoint_ready=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ "$i" -gt 1 ] && sleep 15
+            status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+              "${AUTH_HEADERS[@]}" "$API/endpoints/${STACK_ENDPOINT_ID}/docker/info")"
+            if [ "$status" -lt 400 ]; then
+              endpoint_ready=1
+              break
             fi
-            while read -r container_id; do
-              [ -n "$container_id" ] || continue
-              curl -sf --max-time 60 -X DELETE \
-                "${AUTH_HEADERS[@]}" \
-                "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/containers/${container_id}?force=true&v=false"
-            done <<< "$container_ids"
-          }
-
-          curl -s -o /dev/null -w 'endpoint warmup HTTP %{http_code}\n' --max-time 30 \
-            "${AUTH_HEADERS[@]}" "$API/endpoints/${PORTAINER_ENDPOINT_ID}/docker/info"
+            echo "Endpoint warmup ${i}/10 returned HTTP ${status}"
+          done
+          if [ "$endpoint_ready" -ne 1 ]; then
+            echo "::error title=Portainer endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
+            exit 1
+          fi
           if [ "$DAEMON_CHANGED" = "true" ]; then
             pull_image "$CLIENT_IMAGE"
-          fi
-          if [ "$DAEMON_CHANGED" = "true" ] || [ "$DEPLOY_CONFIG_CHANGED" = "true" ]; then
-            compose_project="$(echo "$STACK_RESP" | jq -r '.Name // empty')"
-            [ -n "$compose_project" ] && [ "$compose_project" != "null" ] || compose_project="portless-client-dev"
-            remove_compose_services "$compose_project" "portless-daemon"
           fi
           curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
             -d @"$PAYLOAD_FILE" \
-            "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${PORTAINER_ENDPOINT_ID}"
+            "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
 
           verified=0
           for i in 1 2 3 4 5 6 7 8 9 10; do
             UPDATED_FILE="$(curl -sf --max-time 30 \
               "${AUTH_HEADERS[@]}" \
-              "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${PORTAINER_ENDPOINT_ID}" |
+              "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
               jq -r '.StackFileContent')"
             if [ "$UPDATED_FILE" = "$STACK_FILE" ]; then
               verified=1

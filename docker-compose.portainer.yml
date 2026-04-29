@@ -3,6 +3,7 @@
 services:
   portless-daemon:
     image: ${PORTLESS_CLIENT_IMAGE}
+    container_name: ${PORTLESS_CONTAINER_PREFIX:-portless-client-staging}-portless-daemon
     restart: unless-stopped
     network_mode: host
     environment:
@@ -17,3 +18,4 @@ services:
 
 volumes:
   portless-daemon-data:
+    name: ${PORTLESS_DAEMON_VOLUME_NAME:-portless-client-dev_portless-daemon-data}
