@@ -208,6 +208,7 @@ async fn forward_request(
     let mut send = send;
     match send_local_request(&http, &pms_url, &request, body).await {
         Ok(response) => {
+            let rewrite = RedirectRewrite::from_request(&pms_url, &request.headers);
             stream_local_response(
                 request.id,
                 request.method,
@@ -215,6 +216,7 @@ async fn forward_request(
                 &mut send,
                 false,
                 started,
+                rewrite.as_ref(),
             )
             .await
         }
@@ -254,6 +256,7 @@ async fn forward_upgrade_request(
                 .await
         }
         Ok(response) => {
+            let rewrite = RedirectRewrite::from_request(&pms_url, &request.headers);
             stream_local_response(
                 request.id,
                 request.method,
@@ -261,6 +264,7 @@ async fn forward_upgrade_request(
                 &mut send,
                 false,
                 started,
+                rewrite.as_ref(),
             )
             .await
         }
@@ -380,12 +384,13 @@ async fn stream_local_response(
     send: &mut SendStream,
     allow_upgrade_headers: bool,
     started: time::Instant,
+    rewrite: Option<&RedirectRewrite>,
 ) -> Result<()> {
     let status = response.status().as_u16();
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
-        headers: serializable_response_headers(response.headers(), allow_upgrade_headers),
+        headers: serializable_response_headers(response.headers(), allow_upgrade_headers, rewrite),
     };
     if let Err(err) = write_json_frame(send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
@@ -473,7 +478,7 @@ async fn stream_local_upgrade_response(
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
-        headers: serializable_response_headers(response.headers(), true),
+        headers: serializable_response_headers(response.headers(), true, None),
     };
     if let Err(err) = write_json_frame(&mut send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
@@ -625,6 +630,70 @@ fn pms_target_url(pms_url: &Url, path_query: &str) -> Result<Url> {
     Url::parse(&format!("{prefix}{suffix}")).context("build local PMS request URL")
 }
 
+struct RedirectRewrite {
+    pms_origin: Url,
+    public_origin: Url,
+}
+
+impl RedirectRewrite {
+    fn from_request(pms_url: &Url, headers: &[HeaderPair]) -> Option<Self> {
+        let public_host = first_header(headers, "x-forwarded-host")
+            .or_else(|| first_header(headers, "host"))?
+            .split(',')
+            .next()?
+            .trim();
+        if public_host.is_empty() {
+            return None;
+        }
+        let public_scheme = first_header(headers, "x-forwarded-proto")
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| {
+                value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https")
+            })
+            .unwrap_or("https")
+            .to_ascii_lowercase();
+        let public_origin = Url::parse(&format!("{public_scheme}://{public_host}/")).ok()?;
+        let mut pms_origin = pms_url.clone();
+        pms_origin.set_path("");
+        pms_origin.set_query(None);
+        pms_origin.set_fragment(None);
+        Some(Self {
+            pms_origin,
+            public_origin,
+        })
+    }
+
+    fn location(&self, raw: &str) -> Option<String> {
+        let mut location = Url::parse(raw).ok()?;
+        if !same_url_origin(&location, &self.pms_origin)
+            && !same_url_host_port(&location, &self.public_origin)
+        {
+            return None;
+        }
+        location.set_scheme(self.public_origin.scheme()).ok()?;
+        location.set_host(self.public_origin.host_str()).ok()?;
+        location.set_port(self.public_origin.port()).ok()?;
+        Some(location.to_string())
+    }
+}
+
+fn first_header<'a>(headers: &'a [HeaderPair], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+fn same_url_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme() && same_url_host_port(left, right)
+}
+
+fn same_url_host_port(left: &Url, right: &Url) -> bool {
+    left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
     let raw = relay_address.trim();
     if raw.is_empty() {
@@ -739,6 +808,7 @@ fn serializable_headers(headers: &HeaderMap) -> Vec<HeaderPair> {
 fn serializable_response_headers(
     headers: &HeaderMap,
     allow_upgrade_headers: bool,
+    rewrite: Option<&RedirectRewrite>,
 ) -> Vec<HeaderPair> {
     headers
         .iter()
@@ -746,9 +816,17 @@ fn serializable_response_headers(
             if !allow_upgrade_headers && is_hop_by_hop_response(name) {
                 return None;
             }
+            let raw_value = value.to_str().ok()?;
+            let value = if name == header::LOCATION {
+                rewrite
+                    .and_then(|rewrite| rewrite.location(raw_value))
+                    .unwrap_or_else(|| raw_value.to_owned())
+            } else {
+                raw_value.to_owned()
+            };
             Some(HeaderPair {
                 name: name.as_str().to_owned(),
-                value: value.to_str().ok()?.to_owned(),
+                value,
             })
         })
         .collect()
@@ -779,7 +857,6 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "host"
             | "content-length"
     )
 }
@@ -960,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_hop_by_hop_headers() {
+    fn omits_hop_by_hop_headers_but_keeps_host() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "plex.example.com".parse().unwrap());
         headers.insert(header::CONNECTION, "keep-alive".parse().unwrap());
@@ -969,8 +1046,38 @@ mod tests {
 
         let got = serializable_headers(&headers);
 
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, "accept");
+        assert_eq!(got.len(), 2);
+        assert!(got
+            .iter()
+            .any(|header| header.name == "host" && header.value == "plex.example.com"));
+        assert!(got
+            .iter()
+            .any(|header| header.name == "accept" && header.value == "text/html"));
+    }
+
+    #[test]
+    fn rewrites_local_pms_redirects_to_public_origin() {
+        let pms_url = Url::parse("http://127.0.0.1:32400").unwrap();
+        let rewrite = RedirectRewrite::from_request(
+            &pms_url,
+            &[
+                HeaderPair {
+                    name: "host".to_owned(),
+                    value: "antoine.staging.portless.io".to_owned(),
+                },
+                HeaderPair {
+                    name: "x-forwarded-proto".to_owned(),
+                    value: "https".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let got = rewrite
+            .location("http://127.0.0.1:32400/web/index.html")
+            .unwrap();
+
+        assert_eq!(got, "https://antoine.staging.portless.io/web/index.html");
     }
 
     #[test]
@@ -980,7 +1087,7 @@ mod tests {
         headers.insert(header::UPGRADE, "websocket".parse().unwrap());
         headers.insert("sec-websocket-accept", "abc".parse().unwrap());
 
-        let got = serializable_response_headers(&headers, true);
+        let got = serializable_response_headers(&headers, true, None);
 
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|header| header.name == "connection"));
