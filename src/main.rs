@@ -11,6 +11,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider();
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -53,4 +54,8 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }

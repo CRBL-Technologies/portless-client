@@ -17,7 +17,7 @@ This daemon checklist mirrors the server transport checklist. The WebSocket tunn
 - [x] Plex Range requests use the same parser-backed HTTP client path; no custom raw HTTP parser remains.
 - [x] Reconnect uses bounded exponential backoff with jitter and handles NAT rebinding.
 - [x] Request cancellation propagates across the QUIC stream.
-- [ ] Integration coverage exercises normal HTTP, large streaming bodies, Range, Plex WebSocket notifications, SSE, cancellation, daemon reconnect, and certificate rejection.
+- [x] Integration coverage exercises normal HTTP, large streaming bodies, Range, Plex WebSocket notifications, SSE, cancellation, daemon reconnect, and certificate rejection.
 
 ## Cutover Guardrails
 
