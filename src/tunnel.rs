@@ -234,6 +234,7 @@ async fn forward_request(
                 status: 502,
                 request_bytes: 0,
                 response_bytes: 0,
+                io: DaemonIoMetrics::default(),
                 started,
                 outcome: "pms_request_failed",
             });
@@ -282,6 +283,7 @@ async fn forward_upgrade_request(
                 status: 502,
                 request_bytes: 0,
                 response_bytes: 0,
+                io: DaemonIoMetrics::default(),
                 started,
                 outcome: "pms_upgrade_request_failed",
             });
@@ -400,6 +402,7 @@ async fn stream_local_response(
             status,
             request_bytes: 0,
             response_bytes: 0,
+            io: DaemonIoMetrics::default(),
             started,
             outcome: "write_head_failed",
         });
@@ -408,7 +411,16 @@ async fn stream_local_response(
 
     let mut body = response.bytes_stream();
     let mut response_bytes = 0_u64;
-    while let Some(chunk) = body.next().await {
+    let mut io_metrics = DaemonIoMetrics::default();
+    loop {
+        let pms_read_started = time::Instant::now();
+        let chunk = body.next().await;
+        io_metrics.pms_read_wait_ms = io_metrics
+            .pms_read_wait_ms
+            .saturating_add(elapsed_millis(pms_read_started));
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(err) => {
@@ -419,6 +431,7 @@ async fn stream_local_response(
                     status,
                     request_bytes: 0,
                     response_bytes,
+                    io: io_metrics,
                     started,
                     outcome: "pms_read_failed",
                 });
@@ -426,7 +439,12 @@ async fn stream_local_response(
             }
         };
         response_bytes = response_bytes.saturating_add(chunk.len() as u64);
-        if let Err(err) = send.write_all(&chunk).await {
+        let quic_write_started = time::Instant::now();
+        let write_result = send.write_all(&chunk).await;
+        io_metrics.quic_write_wait_ms = io_metrics
+            .quic_write_wait_ms
+            .saturating_add(elapsed_millis(quic_write_started));
+        if let Err(err) = write_result {
             log_daemon_transfer(DaemonTransferLog {
                 request_id: &request_id,
                 method: &method,
@@ -434,6 +452,7 @@ async fn stream_local_response(
                 status,
                 request_bytes: 0,
                 response_bytes,
+                io: io_metrics,
                 started,
                 outcome: "quic_write_failed",
             });
@@ -448,6 +467,7 @@ async fn stream_local_response(
             status,
             request_bytes: 0,
             response_bytes,
+            io: io_metrics,
             started,
             outcome: "finish_failed",
         });
@@ -460,6 +480,7 @@ async fn stream_local_response(
         status,
         request_bytes: 0,
         response_bytes,
+        io: io_metrics,
         started,
         outcome: "ok",
     });
@@ -488,6 +509,7 @@ async fn stream_local_upgrade_response(
             status,
             request_bytes: 0,
             response_bytes: 0,
+            io: DaemonIoMetrics::default(),
             started,
             outcome: "write_head_failed",
         });
@@ -504,6 +526,7 @@ async fn stream_local_upgrade_response(
                 status,
                 request_bytes: 0,
                 response_bytes: 0,
+                io: DaemonIoMetrics::default(),
                 started,
                 outcome: "pms_upgrade_failed",
             });
@@ -544,6 +567,7 @@ async fn stream_local_upgrade_response(
                 status,
                 request_bytes,
                 response_bytes,
+                io: DaemonIoMetrics::default(),
                 started,
                 outcome: "ok",
             });
@@ -556,6 +580,7 @@ async fn stream_local_upgrade_response(
                 status,
                 request_bytes: 0,
                 response_bytes: 0,
+                io: DaemonIoMetrics::default(),
                 started,
                 outcome: "copy_failed",
             });
@@ -740,8 +765,15 @@ struct DaemonTransferLog<'a> {
     status: u16,
     request_bytes: u64,
     response_bytes: u64,
+    io: DaemonIoMetrics,
     started: time::Instant,
     outcome: &'static str,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DaemonIoMetrics {
+    pms_read_wait_ms: u64,
+    quic_write_wait_ms: u64,
 }
 
 fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
@@ -755,6 +787,8 @@ fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
         response_bytes = event.response_bytes,
         duration_ms,
         response_bytes_per_sec = bytes_per_second(event.response_bytes, duration_ms),
+        pms_read_wait_ms = event.io.pms_read_wait_ms,
+        quic_write_wait_ms = event.io.quic_write_wait_ms,
         outcome = event.outcome,
         "daemon transfer finished"
     );
