@@ -206,12 +206,13 @@ async fn forward_request(
     let body = quic_request_body(recv);
     let mut send = send;
     match send_local_request(&http, &pms_url, &request, body).await {
-        Ok(response) => stream_local_response(request.id, response, &mut send, false).await,
+        Ok(response) => {
+            stream_local_response(request.id, request.method, response, &mut send, false).await
+        }
         Err(err) => {
             warn!(
                 request_id = %request.id,
                 method = %request.method,
-                path = %request.path_query,
                 error = %format!("{err:#}"),
                 "local PMS request failed"
             );
@@ -229,14 +230,15 @@ async fn forward_upgrade_request(
 ) -> Result<()> {
     match send_local_upgrade_request(&http, &pms_url, &request).await {
         Ok(response) if response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS => {
-            stream_local_upgrade_response(request.id, response, send, recv).await
+            stream_local_upgrade_response(request.id, request.method, response, send, recv).await
         }
-        Ok(response) => stream_local_response(request.id, response, &mut send, false).await,
+        Ok(response) => {
+            stream_local_response(request.id, request.method, response, &mut send, false).await
+        }
         Err(err) => {
             warn!(
                 request_id = %request.id,
                 method = %request.method,
-                path = %request.path_query,
                 error = %format!("{err:#}"),
                 "local PMS upgrade request failed"
             );
@@ -334,75 +336,188 @@ fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
 
 async fn stream_local_response(
     request_id: String,
+    method: String,
     response: reqwest::Response,
     send: &mut SendStream,
     allow_upgrade_headers: bool,
 ) -> Result<()> {
+    let started = time::Instant::now();
+    let status = response.status().as_u16();
     let head = TunnelResponseHead {
         id: request_id.clone(),
-        status: response.status().as_u16(),
+        status,
         headers: serializable_response_headers(response.headers(), allow_upgrade_headers),
     };
-    write_json_frame(send, &head)
-        .await
-        .context("write response head")?;
+    if let Err(err) = write_json_frame(send, &head).await {
+        log_daemon_transfer(
+            &request_id,
+            &method,
+            "http",
+            status,
+            0,
+            0,
+            started,
+            "write_head_failed",
+        );
+        return Err(err).context("write response head");
+    }
 
     let mut body = response.bytes_stream();
+    let mut response_bytes = 0_u64;
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.context("read local PMS response chunk")?;
-        send.write_all(&chunk)
-            .await
-            .context("write response body chunk")?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                log_daemon_transfer(
+                    &request_id,
+                    &method,
+                    "http",
+                    status,
+                    0,
+                    response_bytes,
+                    started,
+                    "pms_read_failed",
+                );
+                return Err(err).context("read local PMS response chunk");
+            }
+        };
+        response_bytes = response_bytes.saturating_add(chunk.len() as u64);
+        if let Err(err) = send.write_all(&chunk).await {
+            log_daemon_transfer(
+                &request_id,
+                &method,
+                "http",
+                status,
+                0,
+                response_bytes,
+                started,
+                "quic_write_failed",
+            );
+            return Err(err).context("write response body chunk");
+        }
     }
-    send.finish().context("finish response stream")?;
+    if let Err(err) = send.finish() {
+        log_daemon_transfer(
+            &request_id,
+            &method,
+            "http",
+            status,
+            0,
+            response_bytes,
+            started,
+            "finish_failed",
+        );
+        return Err(err).context("finish response stream");
+    }
+    log_daemon_transfer(
+        &request_id,
+        &method,
+        "http",
+        status,
+        0,
+        response_bytes,
+        started,
+        "ok",
+    );
     Ok(())
 }
 
 async fn stream_local_upgrade_response(
     request_id: String,
+    method: String,
     response: reqwest::Response,
     mut send: SendStream,
     recv: RecvStream,
 ) -> Result<()> {
+    let started = time::Instant::now();
+    let status = response.status().as_u16();
     let head = TunnelResponseHead {
-        id: request_id,
-        status: response.status().as_u16(),
+        id: request_id.clone(),
+        status,
         headers: serializable_response_headers(response.headers(), true),
     };
-    write_json_frame(&mut send, &head)
-        .await
-        .context("write upgrade response head")?;
+    if let Err(err) = write_json_frame(&mut send, &head).await {
+        log_daemon_transfer(
+            &request_id,
+            &method,
+            "upgrade",
+            status,
+            0,
+            0,
+            started,
+            "write_head_failed",
+        );
+        return Err(err).context("write upgrade response head");
+    }
 
-    let upgraded = response
-        .upgrade()
-        .await
-        .context("upgrade local PMS response")?;
+    let upgraded = match response.upgrade().await {
+        Ok(upgraded) => upgraded,
+        Err(err) => {
+            log_daemon_transfer(
+                &request_id,
+                &method,
+                "upgrade",
+                status,
+                0,
+                0,
+                started,
+                "pms_upgrade_failed",
+            );
+            return Err(err).context("upgrade local PMS response");
+        }
+    };
     let (mut pms_read, mut pms_write) = tokio_io::split(upgraded);
     let mut relay_send = send;
     let mut relay_recv = recv;
 
     let relay_to_pms = async {
-        tokio_io::copy(&mut relay_recv, &mut pms_write)
+        let copied = tokio_io::copy(&mut relay_recv, &mut pms_write)
             .await
             .context("copy upgraded QUIC bytes to PMS")?;
         pms_write
             .shutdown()
             .await
             .context("shutdown upgraded PMS write")?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(copied)
     };
 
     let pms_to_relay = async {
-        tokio_io::copy(&mut pms_read, &mut relay_send)
+        let copied = tokio_io::copy(&mut pms_read, &mut relay_send)
             .await
             .context("copy upgraded PMS bytes to QUIC")?;
         relay_send
             .finish()
             .context("finish upgraded QUIC response stream")?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(copied)
     };
 
-    tokio::try_join!(relay_to_pms, pms_to_relay)?;
+    match tokio::try_join!(relay_to_pms, pms_to_relay) {
+        Ok((request_bytes, response_bytes)) => {
+            log_daemon_transfer(
+                &request_id,
+                &method,
+                "upgrade",
+                status,
+                request_bytes,
+                response_bytes,
+                started,
+                "ok",
+            );
+        }
+        Err(err) => {
+            log_daemon_transfer(
+                &request_id,
+                &method,
+                "upgrade",
+                status,
+                0,
+                0,
+                started,
+                "copy_failed",
+            );
+            return Err(err);
+        }
+    }
     Ok(())
 }
 
@@ -496,6 +611,38 @@ async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
         server_name: host,
         addr,
     })
+}
+
+fn bytes_per_second(bytes: u64, duration_ms: u64) -> u64 {
+    if duration_ms == 0 {
+        return 0;
+    }
+    bytes.saturating_mul(1000) / duration_ms
+}
+
+fn log_daemon_transfer(
+    request_id: &str,
+    method: &str,
+    kind: &'static str,
+    status: u16,
+    request_bytes: u64,
+    response_bytes: u64,
+    started: time::Instant,
+    outcome: &'static str,
+) {
+    let duration_ms = started.elapsed().as_millis() as u64;
+    info!(
+        request_id,
+        method,
+        kind,
+        status,
+        request_bytes,
+        response_bytes,
+        duration_ms,
+        response_bytes_per_sec = bytes_per_second(response_bytes, duration_ms),
+        outcome,
+        "daemon transfer finished"
+    );
 }
 
 fn reconnect_delay(cfg: &Config, attempt: u32) -> Duration {
