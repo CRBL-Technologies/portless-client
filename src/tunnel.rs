@@ -199,15 +199,24 @@ async fn forward_request(
     let request: TunnelRequest = read_json_frame(&mut recv)
         .await
         .context("read relay request head")?;
+    let started = time::Instant::now();
     if request.upgrade.is_some() {
-        return forward_upgrade_request(http, pms_url, request, send, recv).await;
+        return forward_upgrade_request(http, pms_url, request, send, recv, started).await;
     }
 
     let body = quic_request_body(recv);
     let mut send = send;
     match send_local_request(&http, &pms_url, &request, body).await {
         Ok(response) => {
-            stream_local_response(request.id, request.method, response, &mut send, false).await
+            stream_local_response(
+                request.id,
+                request.method,
+                response,
+                &mut send,
+                false,
+                started,
+            )
+            .await
         }
         Err(err) => {
             warn!(
@@ -216,6 +225,16 @@ async fn forward_request(
                 error = %format!("{err:#}"),
                 "local PMS request failed"
             );
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request.id,
+                method: &request.method,
+                kind: "http",
+                status: 502,
+                request_bytes: 0,
+                response_bytes: 0,
+                started,
+                outcome: "pms_request_failed",
+            });
             send_error_response(request.id, err, &mut send).await
         }
     }
@@ -227,13 +246,23 @@ async fn forward_upgrade_request(
     request: TunnelRequest,
     mut send: SendStream,
     recv: RecvStream,
+    started: time::Instant,
 ) -> Result<()> {
     match send_local_upgrade_request(&http, &pms_url, &request).await {
         Ok(response) if response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS => {
-            stream_local_upgrade_response(request.id, request.method, response, send, recv).await
+            stream_local_upgrade_response(request.id, request.method, response, send, recv, started)
+                .await
         }
         Ok(response) => {
-            stream_local_response(request.id, request.method, response, &mut send, false).await
+            stream_local_response(
+                request.id,
+                request.method,
+                response,
+                &mut send,
+                false,
+                started,
+            )
+            .await
         }
         Err(err) => {
             warn!(
@@ -242,6 +271,16 @@ async fn forward_upgrade_request(
                 error = %format!("{err:#}"),
                 "local PMS upgrade request failed"
             );
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request.id,
+                method: &request.method,
+                kind: "upgrade",
+                status: 502,
+                request_bytes: 0,
+                response_bytes: 0,
+                started,
+                outcome: "pms_upgrade_request_failed",
+            });
             send_error_response(request.id, err, &mut send).await
         }
     }
@@ -340,8 +379,8 @@ async fn stream_local_response(
     response: reqwest::Response,
     send: &mut SendStream,
     allow_upgrade_headers: bool,
+    started: time::Instant,
 ) -> Result<()> {
-    let started = time::Instant::now();
     let status = response.status().as_u16();
     let head = TunnelResponseHead {
         id: request_id.clone(),
@@ -428,8 +467,8 @@ async fn stream_local_upgrade_response(
     response: reqwest::Response,
     mut send: SendStream,
     recv: RecvStream,
+    started: time::Instant,
 ) -> Result<()> {
-    let started = time::Instant::now();
     let status = response.status().as_u16();
     let head = TunnelResponseHead {
         id: request_id.clone(),
@@ -632,7 +671,7 @@ struct DaemonTransferLog<'a> {
 }
 
 fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
-    let duration_ms = event.started.elapsed().as_millis() as u64;
+    let duration_ms = elapsed_millis(event.started);
     info!(
         request_id = event.request_id,
         method = event.method,
@@ -645,6 +684,16 @@ fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
         outcome = event.outcome,
         "daemon transfer finished"
     );
+}
+
+fn elapsed_millis(started: time::Instant) -> u64 {
+    let elapsed = started.elapsed();
+    let millis = elapsed.as_millis() as u64;
+    if millis == 0 && elapsed > Duration::ZERO {
+        1
+    } else {
+        millis
+    }
 }
 
 fn reconnect_delay(cfg: &Config, attempt: u32) -> Duration {
