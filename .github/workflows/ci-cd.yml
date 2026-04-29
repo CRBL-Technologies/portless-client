@@ -183,11 +183,11 @@ jobs:
           missing=0
           for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
             if [ -z "${!name:-}" ]; then
-              echo "::notice title=Deploy skipped::Missing ${name}"
+              echo "::error title=Deploy secret missing::Missing ${name}"
               missing=1
             fi
           done
-          [ "$missing" -eq 1 ] && exit 0
+          [ "$missing" -eq 1 ] && exit 1
 
           API="${PORTAINER_URL%/}/api"
           AUTH_HEADERS=(-A "crbl-ops/1.0" \
@@ -230,7 +230,7 @@ jobs:
           PAYLOAD_FILE="$(mktemp)"
           printf '%s' "$ENV_JSON" > "$ENV_FILE"
           jq -n --arg file "$STACK_FILE" --slurpfile env "$ENV_FILE" \
-            '{StackFileContent: $file, Env: $env[0], pullImage: true}' > "$PAYLOAD_FILE"
+            '{stackFileContent: $file, env: $env[0], pullImage: true}' > "$PAYLOAD_FILE"
 
           urlencode() {
             jq -rn --arg value "$1" '$value | @uri'
