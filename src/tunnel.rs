@@ -118,7 +118,13 @@ async fn forward_request(
             }
         }
         Err(err) => {
-            warn!(request_id = %request_id, error = %err, "local PMS request failed");
+            warn!(
+                request_id = %request_id,
+                method = %request.method,
+                path = %request.path_query,
+                error = %format!("{err:#}"),
+                "local PMS request failed"
+            );
             if let Err(send_err) = send_error_response(request_id.clone(), err, out_tx).await {
                 warn!(request_id = %request_id, error = %send_err, "send relay error response failed");
             }
@@ -157,6 +163,15 @@ async fn send_local_request(
         .await
         .context("send local PMS request")
         .map(LocalResponse::Reqwest)
+        .or_else(|err| {
+            if should_retry_raw_http(pms_url, request) {
+                Ok(LocalResponse::RawRetry(err))
+            } else {
+                Err(err)
+            }
+        })?
+        .resolve_raw_retry(pms_url, request)
+        .await
 }
 
 async fn stream_local_response(
@@ -182,6 +197,7 @@ async fn stream_local_response(
             stream_reqwest_body(&request_id, response, &out_tx).await?
         }
         LocalResponse::Raw(response) => stream_raw_body(&request_id, response, &out_tx).await?,
+        LocalResponse::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
     }
 
     out_tx
@@ -324,6 +340,10 @@ fn should_use_raw_http(pms_url: &Url, request: &TunnelRequest) -> bool {
             .headers
             .iter()
             .any(|header| header.name.eq_ignore_ascii_case("range"))
+}
+
+fn should_retry_raw_http(pms_url: &Url, request: &TunnelRequest) -> bool {
+    pms_url.scheme() == "http" && matches!(request.method.as_str(), "GET" | "HEAD")
 }
 
 async fn send_raw_http_request(pms_url: &Url, request: &TunnelRequest) -> Result<RawHttpResponse> {
@@ -557,13 +577,25 @@ fn is_raw_request_omitted_header(name: &HeaderName) -> bool {
 enum LocalResponse {
     Reqwest(reqwest::Response),
     Raw(RawHttpResponse),
+    RawRetry(anyhow::Error),
 }
 
 impl LocalResponse {
+    async fn resolve_raw_retry(self, pms_url: &Url, request: &TunnelRequest) -> Result<Self> {
+        match self {
+            Self::RawRetry(err) => send_raw_http_request(pms_url, request)
+                .await
+                .map(Self::Raw)
+                .with_context(|| format!("retry raw PMS HTTP after reqwest failure: {err:#}")),
+            other => Ok(other),
+        }
+    }
+
     fn status(&self) -> u16 {
         match self {
             Self::Reqwest(response) => response.status().as_u16(),
             Self::Raw(response) => response.status,
+            Self::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
         }
     }
 
@@ -571,6 +603,7 @@ impl LocalResponse {
         match self {
             Self::Reqwest(response) => serializable_headers(response.headers()),
             Self::Raw(response) => response.headers.clone(),
+            Self::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
         }
     }
 }
