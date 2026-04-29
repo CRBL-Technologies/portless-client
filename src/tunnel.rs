@@ -22,7 +22,12 @@ use rustls::{
     RootCertStore,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::{fs, net::lookup_host, time};
+use tokio::{
+    fs,
+    io::{self as tokio_io, AsyncWriteExt},
+    net::lookup_host,
+    time,
+};
 use tracing::{info, warn};
 use x509_parser::prelude::*;
 
@@ -184,15 +189,20 @@ async fn send_hello(connection: &Connection, device: &DeviceConfig) -> Result<()
 async fn forward_request(
     http: Client,
     pms_url: Url,
-    mut send: SendStream,
+    send: SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
     let request: TunnelRequest = read_json_frame(&mut recv)
         .await
         .context("read relay request head")?;
+    if request.upgrade.is_some() {
+        return forward_upgrade_request(http, pms_url, request, send, recv).await;
+    }
+
     let body = quic_request_body(recv);
+    let mut send = send;
     match send_local_request(&http, &pms_url, &request, body).await {
-        Ok(response) => stream_local_response(request.id, response, &mut send).await,
+        Ok(response) => stream_local_response(request.id, response, &mut send, false).await,
         Err(err) => {
             warn!(
                 request_id = %request.id,
@@ -200,6 +210,31 @@ async fn forward_request(
                 path = %request.path_query,
                 error = %format!("{err:#}"),
                 "local PMS request failed"
+            );
+            send_error_response(request.id, err, &mut send).await
+        }
+    }
+}
+
+async fn forward_upgrade_request(
+    http: Client,
+    pms_url: Url,
+    request: TunnelRequest,
+    mut send: SendStream,
+    recv: RecvStream,
+) -> Result<()> {
+    match send_local_upgrade_request(&http, &pms_url, &request).await {
+        Ok(response) if response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS => {
+            stream_local_upgrade_response(request.id, response, send, recv).await
+        }
+        Ok(response) => stream_local_response(request.id, response, &mut send, false).await,
+        Err(err) => {
+            warn!(
+                request_id = %request.id,
+                method = %request.method,
+                path = %request.path_query,
+                error = %format!("{err:#}"),
+                "local PMS upgrade request failed"
             );
             send_error_response(request.id, err, &mut send).await
         }
@@ -228,6 +263,35 @@ async fn send_local_request(
         .send()
         .await
         .context("send local PMS request")
+}
+
+async fn send_local_upgrade_request(
+    http: &Client,
+    pms_url: &Url,
+    request: &TunnelRequest,
+) -> Result<reqwest::Response> {
+    let method = Method::from_bytes(request.method.as_bytes()).context("parse request method")?;
+    let target = pms_target_url(pms_url, &request.path_query)?;
+    let upgrade = request
+        .upgrade
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing upgrade token"))?;
+    let mut builder = http
+        .request(method, target)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, upgrade);
+    for header in &request.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes()).context("parse header name")?;
+        if is_hop_by_hop(&name) {
+            continue;
+        }
+        let value = HeaderValue::from_str(&header.value).context("parse header value")?;
+        builder = builder.header(name, value);
+    }
+    builder
+        .send()
+        .await
+        .context("send local PMS upgrade request")
 }
 
 fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
@@ -267,11 +331,12 @@ async fn stream_local_response(
     request_id: String,
     response: reqwest::Response,
     send: &mut SendStream,
+    allow_upgrade_headers: bool,
 ) -> Result<()> {
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status: response.status().as_u16(),
-        headers: serializable_headers(response.headers()),
+        headers: serializable_response_headers(response.headers(), allow_upgrade_headers),
     };
     write_json_frame(send, &head)
         .await
@@ -285,6 +350,54 @@ async fn stream_local_response(
             .context("write response body chunk")?;
     }
     send.finish().context("finish response stream")?;
+    Ok(())
+}
+
+async fn stream_local_upgrade_response(
+    request_id: String,
+    response: reqwest::Response,
+    mut send: SendStream,
+    recv: RecvStream,
+) -> Result<()> {
+    let head = TunnelResponseHead {
+        id: request_id,
+        status: response.status().as_u16(),
+        headers: serializable_response_headers(response.headers(), true),
+    };
+    write_json_frame(&mut send, &head)
+        .await
+        .context("write upgrade response head")?;
+
+    let upgraded = response
+        .upgrade()
+        .await
+        .context("upgrade local PMS response")?;
+    let (mut pms_read, mut pms_write) = tokio_io::split(upgraded);
+    let mut relay_send = send;
+    let mut relay_recv = recv;
+
+    let relay_to_pms = async {
+        tokio_io::copy(&mut relay_recv, &mut pms_write)
+            .await
+            .context("copy upgraded QUIC bytes to PMS")?;
+        pms_write
+            .shutdown()
+            .await
+            .context("shutdown upgraded PMS write")?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let pms_to_relay = async {
+        tokio_io::copy(&mut pms_read, &mut relay_send)
+            .await
+            .context("copy upgraded PMS bytes to QUIC")?;
+        relay_send
+            .finish()
+            .context("finish upgraded QUIC response stream")?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::try_join!(relay_to_pms, pms_to_relay)?;
     Ok(())
 }
 
@@ -409,6 +522,24 @@ fn serializable_headers(headers: &HeaderMap) -> Vec<HeaderPair> {
         .iter()
         .filter_map(|(name, value)| {
             if is_hop_by_hop(name) {
+                return None;
+            }
+            Some(HeaderPair {
+                name: name.as_str().to_owned(),
+                value: value.to_str().ok()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn serializable_response_headers(
+    headers: &HeaderMap,
+    allow_upgrade_headers: bool,
+) -> Vec<HeaderPair> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            if !allow_upgrade_headers && is_hop_by_hop(name) {
                 return None;
             }
             Some(HeaderPair {
@@ -552,6 +683,7 @@ struct TunnelRequest {
     method: String,
     path_query: String,
     headers: Vec<HeaderPair>,
+    upgrade: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -602,11 +734,29 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "plex.example.com".parse().unwrap());
         headers.insert(header::CONNECTION, "keep-alive".parse().unwrap());
+        headers.insert(header::UPGRADE, "websocket".parse().unwrap());
         headers.insert(header::ACCEPT, "text/html".parse().unwrap());
 
         let got = serializable_headers(&headers);
 
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "accept");
+    }
+
+    #[test]
+    fn preserves_upgrade_response_headers_when_requested() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, "Upgrade".parse().unwrap());
+        headers.insert(header::UPGRADE, "websocket".parse().unwrap());
+        headers.insert("sec-websocket-accept", "abc".parse().unwrap());
+
+        let got = serializable_response_headers(&headers, true);
+
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().any(|header| header.name == "connection"));
+        assert!(got.iter().any(|header| header.name == "upgrade"));
+        assert!(got
+            .iter()
+            .any(|header| header.name == "sec-websocket-accept"));
     }
 }
