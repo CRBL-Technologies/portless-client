@@ -12,7 +12,8 @@ This daemon checklist mirrors the server transport checklist. The WebSocket tunn
 - [x] Daemon no longer sends the device token to the relay data path.
 - [x] Each accepted QUIC bidirectional stream maps to one Plex HTTP request.
 - [x] Request and response bodies are streamed as raw bytes over QUIC streams.
-- [ ] Plex WebSocket upgrades and SSE streams are proxied end to end.
+- [x] Plex WebSocket upgrades are proxied as raw HTTP upgrades over the same QUIC stream.
+- [x] SSE and other long-lived response bodies stream over QUIC without full-response buffering.
 - [x] Plex Range requests use the same parser-backed HTTP client path; no custom raw HTTP parser remains.
 - [x] Reconnect uses bounded exponential backoff with jitter and handles NAT rebinding.
 - [ ] Request cancellation propagates across the QUIC stream.
