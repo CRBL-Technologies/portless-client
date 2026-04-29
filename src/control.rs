@@ -50,7 +50,6 @@ impl ControlClient {
             .context("decode device config")
     }
 
-    #[allow(dead_code)]
     pub async fn request_certificate(
         &self,
         csr_pem: &str,
@@ -104,7 +103,6 @@ struct CertificateRequest<'a> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[allow(dead_code)]
 pub struct CertificateResponse {
     pub certificate_pem: String,
     pub chain_pem: String,

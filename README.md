@@ -4,7 +4,7 @@ Rust daemon for the customer-side Portless tunnel.
 
 The MVP install path is Docker Compose only. The daemon reads a reveal-once
 device token, fetches trust and tunnel config from the control plane, stores
-local state under a data directory, opens a WebSocket tunnel to the relay, and
+local state under a data directory, opens a QUIC/mTLS tunnel to the relay, and
 forwards relay HTTP requests to the configured local Plex URL.
 
 ## Environment

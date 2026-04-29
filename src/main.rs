@@ -44,9 +44,10 @@ async fn main() -> Result<()> {
     state.config_generation = Some(device.config_generation);
     state.relay_address = Some(device.relay_address.clone());
     state.save(&cfg.data_dir).await?;
+    let identity = tunnel::ensure_identity(&cfg, &control, &device, &trust).await?;
 
     tokio::select! {
-        result = tunnel::run(cfg, device) => result?,
+        result = tunnel::run(cfg, device, identity) => result?,
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
         }

@@ -9,6 +9,8 @@ Implemented now:
 
 Next implementation slice:
 
+- Follow `docs/quic-cutover-todo.md`; the interim WebSocket tunnel is not an
+  accepted fallback.
 - Generate and encrypt a local private key.
 - Submit CSR with proof-of-possession and stable request id.
 - Establish QUIC/mTLS tunnel to the relay.

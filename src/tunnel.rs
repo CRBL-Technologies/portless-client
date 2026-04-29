@@ -1,133 +1,207 @@
-use std::{cmp, time::Duration};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    io::{self, Cursor},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::StreamExt;
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
+    redirect::Policy,
     Client, Method, Url,
 };
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::mpsc,
-    time,
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    RootCertStore,
 };
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
-};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::{fs, net::lookup_host, time};
 use tracing::{info, warn};
+use x509_parser::prelude::*;
 
-use crate::{config::Config, control::DeviceConfig};
+use crate::{
+    config::Config,
+    control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
+};
 
-const CONNECT_PATH: &str = "/_portless/connect";
+const ALPN: &[u8] = b"portless-quic-v1";
+const MAX_FRAME_HEAD: usize = 128 * 1024;
+const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
 
-pub async fn run(cfg: Config, device: DeviceConfig) -> Result<()> {
-    let relay_url = relay_websocket_url(&device.relay_address)?;
-    let http = Client::new();
-    loop {
-        if let Err(err) = run_once(&cfg, &http, relay_url.clone()).await {
-            warn!(error = %err, relay = %relay_url, "relay tunnel disconnected");
+pub struct TunnelIdentity {
+    ca_pem: String,
+    cert_pem: String,
+    key_pem: String,
+}
+
+pub async fn ensure_identity(
+    cfg: &Config,
+    control: &ControlClient,
+    device: &DeviceConfig,
+    trust: &TrustBundle,
+) -> Result<TunnelIdentity> {
+    fs::create_dir_all(&cfg.data_dir)
+        .await
+        .context("create daemon data dir")?;
+    let key_path = cfg.data_dir.join("device.key.pem");
+    let cert_path = cfg.data_dir.join("device.cert.pem");
+    let trust_path = cfg.data_dir.join("trust.pem");
+
+    let existing_key = match fs::read_to_string(&key_path).await {
+        Ok(raw) => Some(raw),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).context("read daemon key"),
+    };
+    let existing_cert = match fs::read_to_string(&cert_path).await {
+        Ok(raw) => Some(raw),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).context("read daemon certificate"),
+    };
+    if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
+        if !certificate_needs_renewal(cert_pem, &device.tunnel_id) {
+            fs::write(&trust_path, &trust.pem)
+                .await
+                .context("write trust bundle")?;
+            return Ok(TunnelIdentity {
+                ca_pem: trust.pem.clone(),
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+            });
         }
-        time::sleep(reconnect_delay(&cfg)).await;
+    }
+
+    let key_pair = match existing_key {
+        Some(raw) => KeyPair::from_pem(&raw).context("parse existing daemon key")?,
+        None => KeyPair::generate().context("generate daemon key")?,
+    };
+    let key_pem = key_pair.serialize_pem();
+    let csr_pem = device_csr_pem(device, &key_pair)?;
+    let request_id = format!("{}-{}", device.tunnel_id, device.config_generation);
+    let issued = control
+        .request_certificate(&csr_pem, &request_id)
+        .await
+        .context("request daemon certificate")?;
+    write_identity_files(&cfg.data_dir, &key_pem, &issued, &trust.pem).await?;
+
+    Ok(TunnelIdentity {
+        ca_pem: trust.pem.clone(),
+        cert_pem: issued.certificate_pem,
+        key_pem,
+    })
+}
+
+pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) -> Result<()> {
+    let remote = relay_target(&device.relay_address).await?;
+    let http = Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .context("build PMS HTTP client")?;
+    let client_config = quic_client_config(&identity)?;
+    let mut attempt = 0_u32;
+
+    loop {
+        match run_once(&cfg, &device, &http, &client_config, &remote).await {
+            Ok(()) => {
+                attempt = 0;
+                warn!(relay = %remote.addr, "relay QUIC tunnel closed");
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
+            }
+        }
+        let delay = reconnect_delay(&cfg, attempt);
+        attempt = attempt.saturating_add(1);
+        time::sleep(delay).await;
     }
 }
 
-async fn run_once(cfg: &Config, http: &Client, relay_url: Url) -> Result<()> {
-    let mut request = relay_url
-        .as_str()
-        .into_client_request()
-        .context("build relay websocket request")?;
-    request.headers_mut().insert(
-        header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", cfg.device_token))
-            .context("build relay authorization header")?,
-    );
-
-    let (socket, _) = connect_async(request)
+async fn run_once(
+    cfg: &Config,
+    device: &DeviceConfig,
+    http: &Client,
+    client_config: &quinn::ClientConfig,
+    remote: &RelayTarget,
+) -> Result<()> {
+    let bind: SocketAddr = "[::]:0".parse().expect("valid client bind address");
+    let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
+    endpoint.set_default_client_config(client_config.clone());
+    let connection = endpoint
+        .connect(remote.addr, &remote.server_name)
+        .context("start QUIC relay connection")?
         .await
-        .with_context(|| format!("connect relay websocket {relay_url}"))?;
-    info!(relay = %relay_url, "relay tunnel connected");
+        .context("connect QUIC relay")?;
+    send_hello(&connection, device).await?;
+    info!(relay = %remote.addr, server_name = %remote.server_name, "relay QUIC tunnel connected");
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(64);
-    let writer = async move {
-        while let Some(frame) = out_rx.recv().await {
-            let message = match frame {
-                OutboundFrame::Daemon(frame) => {
-                    let raw = serde_json::to_string(&frame).context("encode relay response")?;
-                    Message::Text(raw)
-                }
-                OutboundFrame::Pong(payload) => Message::Pong(payload),
-            };
-            ws_tx
-                .send(message)
-                .await
-                .context("send relay websocket frame")?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let pms_url = cfg.pms_url.clone();
-    let http = http.clone();
-    let reader = async move {
-        while let Some(message) = ws_rx.next().await {
-            match message.context("read relay websocket frame")? {
-                Message::Text(raw) => {
-                    let RelayFrame::Request { request } =
-                        serde_json::from_str(&raw).context("decode relay request")?;
-                    let http = http.clone();
-                    let pms_url = pms_url.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        forward_request(http, pms_url, request, out_tx).await;
-                    });
-                }
-                Message::Ping(payload) => {
-                    out_tx
-                        .send(OutboundFrame::Pong(payload))
-                        .await
-                        .context("queue websocket pong")?;
-                }
-                Message::Close(_) => return Ok(()),
-                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+    loop {
+        match connection.accept_bi().await {
+            Ok((send, recv)) => {
+                let http = http.clone();
+                let pms_url = cfg.pms_url.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = forward_request(http, pms_url, send, recv).await {
+                        warn!(error = %format!("{err:#}"), "forward QUIC request failed");
+                    }
+                });
             }
+            Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
+            Err(err) => return Err(err).context("accept QUIC request stream"),
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::select! {
-        result = writer => result,
-        result = reader => result,
     }
+}
+
+async fn send_hello(connection: &Connection, device: &DeviceConfig) -> Result<()> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("open daemon hello stream")?;
+    write_json_frame(
+        &mut send,
+        &DaemonHello {
+            tunnel_id: device.tunnel_id.clone(),
+            subdomain: device.subdomain.clone(),
+        },
+    )
+    .await
+    .context("write daemon hello")?;
+    send.finish().context("finish daemon hello stream")?;
+    let ack: RelayHello = read_json_frame(&mut recv)
+        .await
+        .context("read relay hello ack")?;
+    if !ack.accepted {
+        bail!("relay rejected daemon hello");
+    }
+    Ok(())
 }
 
 async fn forward_request(
     http: Client,
     pms_url: Url,
-    request: TunnelRequest,
-    out_tx: mpsc::Sender<OutboundFrame>,
-) {
-    let request_id = request.id.clone();
-    match send_local_request(&http, &pms_url, &request).await {
-        Ok(response) => {
-            if let Err(err) = stream_local_response(request_id.clone(), response, out_tx).await {
-                warn!(request_id = %request_id, error = %err, "stream relay response failed");
-            }
-        }
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()> {
+    let request: TunnelRequest = read_json_frame(&mut recv)
+        .await
+        .context("read relay request head")?;
+    let body = quic_request_body(recv);
+    match send_local_request(&http, &pms_url, &request, body).await {
+        Ok(response) => stream_local_response(request.id, response, &mut send).await,
         Err(err) => {
             warn!(
-                request_id = %request_id,
+                request_id = %request.id,
                 method = %request.method,
                 path = %request.path_query,
                 error = %format!("{err:#}"),
                 "local PMS request failed"
             );
-            if let Err(send_err) = send_error_response(request_id.clone(), err, out_tx).await {
-                warn!(request_id = %request_id, error = %send_err, "send relay error response failed");
-            }
+            send_error_response(request.id, err, &mut send).await
         }
     }
 }
@@ -136,18 +210,10 @@ async fn send_local_request(
     http: &Client,
     pms_url: &Url,
     request: &TunnelRequest,
-) -> Result<LocalResponse> {
-    if should_use_raw_http(pms_url, request) {
-        return send_raw_http_request(pms_url, request)
-            .await
-            .map(LocalResponse::Raw);
-    }
-
+    body: reqwest::Body,
+) -> Result<reqwest::Response> {
     let method = Method::from_bytes(request.method.as_bytes()).context("parse request method")?;
     let target = pms_target_url(pms_url, &request.path_query)?;
-    let body = BASE64
-        .decode(&request.body_base64)
-        .context("decode request body")?;
     let mut builder = http.request(method, target);
     for header in &request.headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).context("parse header name")?;
@@ -162,162 +228,115 @@ async fn send_local_request(
         .send()
         .await
         .context("send local PMS request")
-        .map(LocalResponse::Reqwest)
-        .or_else(|err| {
-            if should_retry_raw_http(pms_url, request) {
-                Ok(LocalResponse::RawRetry(err))
-            } else {
-                Err(err)
+}
+
+fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
+    tokio::spawn(async move {
+        let mut total = 0_u64;
+        let mut buf = vec![0_u8; 64 * 1024];
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(read)) => {
+                    total = total.saturating_add(read as u64);
+                    if total > MAX_REQUEST_BODY {
+                        let err = io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "request body exceeds daemon limit",
+                        );
+                        let _ = tx.send(Err(err)).await;
+                        break;
+                    }
+                    if tx.send(Ok(buf[..read].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let err = io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string());
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
             }
-        })?
-        .resolve_raw_retry(pms_url, request)
-        .await
+        }
+    });
+    reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 async fn stream_local_response(
     request_id: String,
-    response: LocalResponse,
-    out_tx: mpsc::Sender<OutboundFrame>,
-) -> Result<()> {
-    let status = response.status();
-    let headers = response.headers();
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseStart {
-            response: TunnelResponseHead {
-                id: request_id.clone(),
-                status,
-                headers,
-            },
-        }))
-        .await
-        .context("queue response head")?;
-
-    match response {
-        LocalResponse::Reqwest(response) => {
-            stream_reqwest_body(&request_id, response, &out_tx).await?
-        }
-        LocalResponse::Raw(response) => stream_raw_body(&request_id, response, &out_tx).await?,
-        LocalResponse::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
-    }
-
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
-            id: request_id,
-            chunk_base64: String::new(),
-            end: true,
-        }))
-        .await
-        .context("queue response body end")?;
-    Ok(())
-}
-
-async fn stream_reqwest_body(
-    request_id: &str,
     response: reqwest::Response,
-    out_tx: &mpsc::Sender<OutboundFrame>,
+    send: &mut SendStream,
 ) -> Result<()> {
+    let head = TunnelResponseHead {
+        id: request_id.clone(),
+        status: response.status().as_u16(),
+        headers: serializable_headers(response.headers()),
+    };
+    write_json_frame(send, &head)
+        .await
+        .context("write response head")?;
+
     let mut body = response.bytes_stream();
     while let Some(chunk) = body.next().await {
         let chunk = chunk.context("read local PMS response chunk")?;
-        send_body_chunk(request_id, chunk.as_ref(), out_tx).await?;
-    }
-    Ok(())
-}
-
-async fn stream_raw_body(
-    request_id: &str,
-    mut response: RawHttpResponse,
-    out_tx: &mpsc::Sender<OutboundFrame>,
-) -> Result<()> {
-    if !response.body_prefix.is_empty() {
-        let prefix_len = response.body_prefix.len();
-        let send_len = response
-            .content_length
-            .map(|remaining| cmp::min(prefix_len, remaining))
-            .unwrap_or(prefix_len);
-        send_body_chunk(request_id, &response.body_prefix[..send_len], out_tx).await?;
-        if let Some(remaining) = response.content_length.as_mut() {
-            *remaining = remaining.saturating_sub(send_len);
-            if *remaining == 0 {
-                return Ok(());
-            }
-        }
-    }
-
-    let mut buf = vec![0_u8; 64 * 1024];
-    loop {
-        let max_read = response
-            .content_length
-            .map(|remaining| cmp::min(buf.len(), remaining))
-            .unwrap_or(buf.len());
-        if max_read == 0 {
-            return Ok(());
-        }
-        let read = response
-            .stream
-            .read(&mut buf[..max_read])
+        send.write_all(&chunk)
             .await
-            .context("read raw local PMS response body")?;
-        if read == 0 {
-            return Ok(());
-        }
-        send_body_chunk(request_id, &buf[..read], out_tx).await?;
-        if let Some(remaining) = response.content_length.as_mut() {
-            *remaining = remaining.saturating_sub(read);
-        }
+            .context("write response body chunk")?;
     }
-}
-
-async fn send_body_chunk(
-    request_id: &str,
-    chunk: &[u8],
-    out_tx: &mpsc::Sender<OutboundFrame>,
-) -> Result<()> {
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
-            id: request_id.to_owned(),
-            chunk_base64: BASE64.encode(chunk),
-            end: false,
-        }))
-        .await
-        .context("queue response body chunk")
+    send.finish().context("finish response stream")?;
+    Ok(())
 }
 
 async fn send_error_response(
     request_id: String,
     err: anyhow::Error,
-    out_tx: mpsc::Sender<OutboundFrame>,
+    send: &mut SendStream,
 ) -> Result<()> {
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseStart {
-            response: TunnelResponseHead {
-                id: request_id.clone(),
-                status: 502,
-                headers: vec![HeaderPair {
-                    name: header::CONTENT_TYPE.as_str().to_owned(),
-                    value: "text/plain; charset=utf-8".to_owned(),
-                }],
-            },
-        }))
-        .await
-        .context("queue error response head")?;
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
-            id: request_id.clone(),
-            chunk_base64: BASE64.encode(err.to_string()),
-            end: false,
-        }))
-        .await
-        .context("queue error response body")?;
-    out_tx
-        .send(OutboundFrame::Daemon(DaemonFrame::ResponseBody {
+    let body = err.to_string();
+    write_json_frame(
+        send,
+        &TunnelResponseHead {
             id: request_id,
-            chunk_base64: String::new(),
-            end: true,
-        }))
+            status: 502,
+            headers: vec![HeaderPair {
+                name: header::CONTENT_TYPE.as_str().to_owned(),
+                value: "text/plain; charset=utf-8".to_owned(),
+            }],
+        },
+    )
+    .await
+    .context("write error response head")?;
+    send.write_all(body.as_bytes())
         .await
-        .context("queue error response end")?;
+        .context("write error response body")?;
+    send.finish().context("finish error response stream")?;
     Ok(())
+}
+
+async fn write_json_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+    let raw = serde_json::to_vec(value).context("encode JSON frame")?;
+    if raw.len() > MAX_FRAME_HEAD {
+        bail!("JSON frame exceeds {MAX_FRAME_HEAD} bytes");
+    }
+    send.write_all(&(raw.len() as u32).to_be_bytes())
+        .await
+        .context("write JSON frame length")?;
+    send.write_all(&raw).await.context("write JSON frame")
+}
+
+async fn read_json_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+    let mut len = [0_u8; 4];
+    recv.read_exact(&mut len)
+        .await
+        .context("read JSON frame length")?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME_HEAD {
+        bail!("JSON frame exceeds {MAX_FRAME_HEAD} bytes");
+    }
+    let mut raw = vec![0_u8; len];
+    recv.read_exact(&mut raw).await.context("read JSON frame")?;
+    serde_json::from_slice(&raw).context("decode JSON frame")
 }
 
 fn pms_target_url(pms_url: &Url, path_query: &str) -> Result<Url> {
@@ -334,209 +353,55 @@ fn pms_target_url(pms_url: &Url, path_query: &str) -> Result<Url> {
     Url::parse(&format!("{prefix}{suffix}")).context("build local PMS request URL")
 }
 
-fn should_use_raw_http(pms_url: &Url, request: &TunnelRequest) -> bool {
-    pms_url.scheme() == "http"
-        && request
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("range"))
-}
-
-fn should_retry_raw_http(pms_url: &Url, request: &TunnelRequest) -> bool {
-    pms_url.scheme() == "http" && matches!(request.method.as_str(), "GET" | "HEAD")
-}
-
-async fn send_raw_http_request(pms_url: &Url, request: &TunnelRequest) -> Result<RawHttpResponse> {
-    let target = pms_target_url(pms_url, &request.path_query)?;
-    if target.scheme() != "http" {
-        return Err(anyhow!("raw PMS request only supports http origins"));
-    }
-    let host = target
-        .host_str()
-        .ok_or_else(|| anyhow!("PMS URL is missing a host"))?;
-    let port = target.port_or_known_default().unwrap_or(80);
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .with_context(|| format!("connect raw PMS HTTP {host}:{port}"))?;
-    let body = BASE64
-        .decode(&request.body_base64)
-        .context("decode request body")?;
-    let path_query = target[url::Position::BeforePath..].to_owned();
-    let host_header = target
-        .host_str()
-        .map(|value| match target.port() {
-            Some(port) => format!("{value}:{port}"),
-            None => value.to_owned(),
-        })
-        .unwrap_or_else(|| host.to_owned());
-
-    let mut raw = Vec::new();
-    raw.extend_from_slice(format!("{} {path_query} HTTP/1.1\r\n", request.method).as_bytes());
-    raw.extend_from_slice(format!("Host: {host_header}\r\n").as_bytes());
-    raw.extend_from_slice(b"Connection: close\r\n");
-    for header in &request.headers {
-        let name = HeaderName::from_bytes(header.name.as_bytes()).context("parse header name")?;
-        if is_raw_request_omitted_header(&name) {
-            continue;
-        }
-        raw.extend_from_slice(header.name.as_bytes());
-        raw.extend_from_slice(b": ");
-        raw.extend_from_slice(header.value.as_bytes());
-        raw.extend_from_slice(b"\r\n");
-    }
-    if !body.is_empty() {
-        raw.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    }
-    raw.extend_from_slice(b"\r\n");
-    raw.extend_from_slice(&body);
-    stream
-        .write_all(&raw)
-        .await
-        .context("write raw PMS HTTP request")?;
-
-    read_raw_http_response(stream).await
-}
-
-async fn read_raw_http_response(mut stream: TcpStream) -> Result<RawHttpResponse> {
-    let mut head = Vec::with_capacity(16 * 1024);
-    let mut buf = [0_u8; 8192];
-    let header_end = loop {
-        let read = stream
-            .read(&mut buf)
-            .await
-            .context("read raw PMS response head")?;
-        if read == 0 {
-            return Err(anyhow!("raw PMS response ended before headers"));
-        }
-        head.extend_from_slice(&buf[..read]);
-        if head.len() > 256 * 1024 {
-            return Err(anyhow!("raw PMS response headers exceed 256 KiB"));
-        }
-        if let Some(index) = find_header_end(&head) {
-            break index;
-        }
-    };
-
-    let body_prefix = head[(header_end + 4)..].to_vec();
-    let header_bytes = &head[..header_end];
-    let header_text = String::from_utf8_lossy(header_bytes);
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("raw PMS response is missing a status line"))?;
-    let status = parse_status(status_line)?;
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.push(HeaderPair {
-            name: name.trim().to_owned(),
-            value: value.trim().to_owned(),
-        });
-    }
-    let (headers, content_length) = sanitize_raw_response_headers(headers);
-    Ok(RawHttpResponse {
-        status,
-        headers,
-        content_length,
-        body_prefix,
-        stream,
-    })
-}
-
-fn parse_status(status_line: &str) -> Result<u16> {
-    status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("raw PMS response status is missing"))?
-        .parse::<u16>()
-        .context("parse raw PMS response status")
-}
-
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn sanitize_raw_response_headers(headers: Vec<HeaderPair>) -> (Vec<HeaderPair>, Option<usize>) {
-    let mut sanitized = Vec::new();
-    let mut content_length_values = Vec::new();
-    let mut content_range = None;
-
-    for header in headers {
-        if header.name.eq_ignore_ascii_case("content-length") {
-            if let Ok(value) = header.value.trim().parse::<usize>() {
-                content_length_values.push(value);
-            }
-            continue;
-        }
-        if header.name.eq_ignore_ascii_case("content-range") {
-            content_range = Some(header.value.clone());
-        }
-        let Ok(name) = HeaderName::from_bytes(header.name.as_bytes()) else {
-            continue;
-        };
-        if is_hop_by_hop(&name) {
-            continue;
-        }
-        sanitized.push(header);
-    }
-
-    let content_length = content_range
-        .as_deref()
-        .and_then(content_length_from_range)
-        .or_else(|| content_length_values.last().copied());
-    if let Some(value) = content_length {
-        sanitized.push(HeaderPair {
-            name: header::CONTENT_LENGTH.as_str().to_owned(),
-            value: value.to_string(),
-        });
-    }
-
-    (sanitized, content_length)
-}
-
-fn content_length_from_range(value: &str) -> Option<usize> {
-    let range = value.trim().strip_prefix("bytes ")?;
-    let (bounds, _) = range.split_once('/')?;
-    let (start, end) = bounds.split_once('-')?;
-    let start = start.parse::<usize>().ok()?;
-    let end = end.parse::<usize>().ok()?;
-    end.checked_sub(start)?.checked_add(1)
-}
-
-fn relay_websocket_url(relay_address: &str) -> Result<Url> {
+async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
     let raw = relay_address.trim();
     if raw.is_empty() {
         return Err(anyhow!("relay address is empty"));
     }
-    let mut url = if raw.starts_with("ws://") || raw.starts_with("wss://") {
-        Url::parse(raw).context("parse relay websocket URL")?
-    } else if raw.starts_with("http://") || raw.starts_with("https://") {
-        let mut url = Url::parse(raw).context("parse relay URL")?;
-        match url.scheme() {
-            "http" => url.set_scheme("ws").map_err(|_| anyhow!("set ws scheme"))?,
-            "https" => url
-                .set_scheme("wss")
-                .map_err(|_| anyhow!("set wss scheme"))?,
-            _ => {}
-        }
-        url
+    let url = if raw.contains("://") {
+        Url::parse(raw).context("parse relay URL")?
     } else {
-        Url::parse(&format!("wss://{raw}")).context("parse relay host")?
+        Url::parse(&format!("https://{raw}")).context("parse relay host")?
     };
-    url.set_path(CONNECT_PATH);
-    url.set_query(None);
-    Ok(url)
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("relay address is missing a host"))?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addr = lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("resolve relay {host}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("relay host resolved to no addresses"))?;
+    Ok(RelayTarget {
+        server_name: host,
+        addr,
+    })
 }
 
-fn reconnect_delay(cfg: &Config) -> Duration {
-    cfg.keepalive_profile
+fn reconnect_delay(cfg: &Config, attempt: u32) -> Duration {
+    let base = cfg
+        .keepalive_profile
         .interval()
-        .min(Duration::from_secs(30))
+        .min(Duration::from_secs(30));
+    let multiplier = 1_u32 << attempt.min(5);
+    let capped = base
+        .saturating_mul(multiplier)
+        .min(Duration::from_secs(120));
+    capped + reconnect_jitter(attempt, base)
+}
+
+fn reconnect_jitter(attempt: u32, base: Duration) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut hasher = DefaultHasher::new();
+    now.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let jitter_ms = hasher.finish() % (base.as_millis().max(1) as u64);
+    Duration::from_millis(jitter_ms)
 }
 
 fn serializable_headers(headers: &HeaderMap) -> Vec<HeaderPair> {
@@ -570,69 +435,115 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-fn is_raw_request_omitted_header(name: &HeaderName) -> bool {
-    is_hop_by_hop(name) || name == header::CONTENT_LENGTH || name == header::HOST
+fn quic_client_config(identity: &TunnelIdentity) -> Result<quinn::ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    for cert in parse_certs_pem(&identity.ca_pem)? {
+        roots.add(cert).context("add relay CA certificate")?;
+    }
+    let certs = parse_certs_pem(&identity.cert_pem)?;
+    let key = parse_private_key_pem(&identity.key_pem)?;
+    let mut client_crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .context("build daemon TLS client config")?;
+    client_crypto.alpn_protocols = vec![ALPN.to_vec()];
+    Ok(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .context("build QUIC rustls client config")?,
+    )))
 }
 
-enum LocalResponse {
-    Reqwest(reqwest::Response),
-    Raw(RawHttpResponse),
-    RawRetry(anyhow::Error),
+fn parse_certs_pem(raw: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let mut reader = Cursor::new(raw.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parse certificate PEM")?;
+    if certs.is_empty() {
+        bail!("certificate PEM did not contain any certificates");
+    }
+    Ok(certs)
 }
 
-impl LocalResponse {
-    async fn resolve_raw_retry(self, pms_url: &Url, request: &TunnelRequest) -> Result<Self> {
-        match self {
-            Self::RawRetry(err) => send_raw_http_request(pms_url, request)
-                .await
-                .map(Self::Raw)
-                .with_context(|| format!("retry raw PMS HTTP after reqwest failure: {err:#}")),
-            other => Ok(other),
-        }
-    }
-
-    fn status(&self) -> u16 {
-        match self {
-            Self::Reqwest(response) => response.status().as_u16(),
-            Self::Raw(response) => response.status,
-            Self::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
-        }
-    }
-
-    fn headers(&self) -> Vec<HeaderPair> {
-        match self {
-            Self::Reqwest(response) => serializable_headers(response.headers()),
-            Self::Raw(response) => response.headers.clone(),
-            Self::RawRetry(_) => unreachable!("raw retry must be resolved before streaming"),
-        }
-    }
+fn parse_private_key_pem(raw: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = Cursor::new(raw.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .context("parse private key PEM")?
+        .ok_or_else(|| anyhow!("private key PEM did not contain a private key"))
 }
 
-struct RawHttpResponse {
-    status: u16,
-    headers: Vec<HeaderPair>,
-    content_length: Option<usize>,
-    body_prefix: Vec<u8>,
-    stream: TcpStream,
+fn device_csr_pem(device: &DeviceConfig, key_pair: &KeyPair) -> Result<String> {
+    let mut params = CertificateParams::new(vec![device.subdomain.clone()])
+        .context("build daemon certificate parameters")?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, device.tunnel_id.clone());
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    params
+        .serialize_request(key_pair)
+        .context("serialize daemon CSR")?
+        .pem()
+        .context("encode daemon CSR PEM")
+}
+
+fn certificate_needs_renewal(cert_pem: &str, tunnel_id: &str) -> bool {
+    let Ok(certs) = parse_certs_pem(cert_pem) else {
+        return true;
+    };
+    let Some(leaf) = certs.first() else {
+        return true;
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return true;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let seconds_left = cert.validity().not_after.timestamp().saturating_sub(now);
+    seconds_left <= renewal_threshold_seconds(tunnel_id)
+}
+
+fn renewal_threshold_seconds(tunnel_id: &str) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    tunnel_id.hash(&mut hasher);
+    let jitter = (hasher.finish() % (24 * 60 * 60)) as i64;
+    (10 * 24 * 60 * 60) + jitter
+}
+
+async fn write_identity_files(
+    data_dir: &Path,
+    key_pem: &str,
+    issued: &CertificateResponse,
+    trust_pem: &str,
+) -> Result<()> {
+    fs::write(data_dir.join("device.key.pem"), key_pem)
+        .await
+        .context("write daemon private key")?;
+    fs::write(data_dir.join("device.cert.pem"), &issued.certificate_pem)
+        .await
+        .context("write daemon certificate")?;
+    fs::write(data_dir.join("trust.pem"), trust_pem)
+        .await
+        .context("write trust bundle")?;
+    Ok(())
+}
+
+struct RelayTarget {
+    server_name: String,
+    addr: SocketAddr,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RelayFrame {
-    Request { request: TunnelRequest },
+struct DaemonHello {
+    tunnel_id: String,
+    subdomain: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum DaemonFrame {
-    ResponseStart {
-        response: TunnelResponseHead,
-    },
-    ResponseBody {
-        id: String,
-        chunk_base64: String,
-        end: bool,
-    },
+struct RelayHello {
+    accepted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -641,7 +552,6 @@ struct TunnelRequest {
     method: String,
     path_query: String,
     headers: Vec<HeaderPair>,
-    body_base64: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -657,35 +567,9 @@ struct HeaderPair {
     value: String,
 }
 
-enum OutboundFrame {
-    Daemon(DaemonFrame),
-    Pong(Vec<u8>),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn builds_wss_url_from_host() {
-        let got = relay_websocket_url("relay.example.com").unwrap();
-
-        assert_eq!(got.as_str(), "wss://relay.example.com/_portless/connect");
-    }
-
-    #[test]
-    fn preserves_explicit_ws_scheme() {
-        let got = relay_websocket_url("ws://localhost:8081").unwrap();
-
-        assert_eq!(got.as_str(), "ws://localhost:8081/_portless/connect");
-    }
-
-    #[test]
-    fn converts_https_to_wss() {
-        let got = relay_websocket_url("https://relay.example.com/foo?bar").unwrap();
-
-        assert_eq!(got.as_str(), "wss://relay.example.com/_portless/connect");
-    }
 
     #[test]
     fn builds_pms_url_with_path_and_query() {
@@ -724,57 +608,5 @@ mod tests {
 
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "accept");
-    }
-
-    #[test]
-    fn sanitizes_conflicting_range_content_lengths() {
-        let (headers, content_length) = sanitize_raw_response_headers(vec![
-            HeaderPair {
-                name: "X-Plex-Protocol".to_owned(),
-                value: "1.0".to_owned(),
-            },
-            HeaderPair {
-                name: "Content-Length".to_owned(),
-                value: "208".to_owned(),
-            },
-            HeaderPair {
-                name: "Content-Range".to_owned(),
-                value: "bytes 0-31/208".to_owned(),
-            },
-            HeaderPair {
-                name: "Content-Length".to_owned(),
-                value: "32".to_owned(),
-            },
-        ]);
-
-        assert_eq!(content_length, Some(32));
-        assert_eq!(
-            headers
-                .iter()
-                .filter(|header| header.name.eq_ignore_ascii_case("content-length"))
-                .count(),
-            1
-        );
-        assert!(headers.iter().any(|header| header.name == "Content-Range"));
-        assert!(headers.iter().any(
-            |header| header.name.eq_ignore_ascii_case("content-length") && header.value == "32"
-        ));
-    }
-
-    #[test]
-    fn detects_range_requests_for_raw_http_path() {
-        let pms_url = Url::parse("http://127.0.0.1:32400").unwrap();
-        let request = TunnelRequest {
-            id: "req_1".to_owned(),
-            method: "GET".to_owned(),
-            path_query: "/library/parts/1/file.mkv".to_owned(),
-            headers: vec![HeaderPair {
-                name: "Range".to_owned(),
-                value: "bytes=0-".to_owned(),
-            }],
-            body_base64: String::new(),
-        };
-
-        assert!(should_use_raw_http(&pms_url, &request));
     }
 }
