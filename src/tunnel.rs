@@ -383,9 +383,9 @@ async fn stream_synthetic_response(
         let write_len = remaining.min(chunk.len() as u64) as usize;
         let quic_write_started = time::Instant::now();
         let write_result = send.write_all(&chunk[..write_len]).await;
-        io_metrics.quic_write_wait_ms = io_metrics
-            .quic_write_wait_ms
-            .saturating_add(elapsed_millis(quic_write_started));
+        io_metrics.quic_write_wait_micros = io_metrics
+            .quic_write_wait_micros
+            .saturating_add(elapsed_micros(quic_write_started));
         if let Err(err) = write_result {
             log_daemon_transfer(DaemonTransferLog {
                 request_id: &request_id,
@@ -554,9 +554,9 @@ async fn stream_local_response(
     loop {
         let pms_read_started = time::Instant::now();
         let chunk = body.next().await;
-        io_metrics.pms_read_wait_ms = io_metrics
-            .pms_read_wait_ms
-            .saturating_add(elapsed_millis(pms_read_started));
+        io_metrics.pms_read_wait_micros = io_metrics
+            .pms_read_wait_micros
+            .saturating_add(elapsed_micros(pms_read_started));
         let Some(chunk) = chunk else {
             break;
         };
@@ -580,9 +580,9 @@ async fn stream_local_response(
         response_bytes = response_bytes.saturating_add(chunk.len() as u64);
         let quic_write_started = time::Instant::now();
         let write_result = send.write_all(&chunk).await;
-        io_metrics.quic_write_wait_ms = io_metrics
-            .quic_write_wait_ms
-            .saturating_add(elapsed_millis(quic_write_started));
+        io_metrics.quic_write_wait_micros = io_metrics
+            .quic_write_wait_micros
+            .saturating_add(elapsed_micros(quic_write_started));
         if let Err(err) = write_result {
             log_daemon_transfer(DaemonTransferLog {
                 request_id: &request_id,
@@ -911,8 +911,8 @@ struct DaemonTransferLog<'a> {
 
 #[derive(Clone, Copy, Default)]
 struct DaemonIoMetrics {
-    pms_read_wait_ms: u64,
-    quic_write_wait_ms: u64,
+    pms_read_wait_micros: u64,
+    quic_write_wait_micros: u64,
 }
 
 fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
@@ -926,8 +926,8 @@ fn log_daemon_transfer(event: DaemonTransferLog<'_>) {
         response_bytes = event.response_bytes,
         duration_ms,
         response_bytes_per_sec = bytes_per_second(event.response_bytes, duration_ms),
-        pms_read_wait_ms = event.io.pms_read_wait_ms,
-        quic_write_wait_ms = event.io.quic_write_wait_ms,
+        pms_read_wait_ms = micros_to_millis(event.io.pms_read_wait_micros),
+        quic_write_wait_ms = micros_to_millis(event.io.quic_write_wait_micros),
         outcome = event.outcome,
         "daemon transfer finished"
     );
@@ -941,6 +941,14 @@ fn elapsed_millis(started: time::Instant) -> u64 {
     } else {
         millis
     }
+}
+
+fn elapsed_micros(started: time::Instant) -> u64 {
+    started.elapsed().as_micros() as u64
+}
+
+fn micros_to_millis(value: u64) -> u64 {
+    value / 1000
 }
 
 fn reconnect_delay(cfg: &Config, attempt: u32) -> Duration {
@@ -1303,5 +1311,12 @@ mod tests {
         assert!(got
             .iter()
             .any(|header| header.name == "sec-websocket-accept"));
+    }
+
+    #[test]
+    fn converts_accumulated_micros_to_whole_millis() {
+        assert_eq!(micros_to_millis(999), 0);
+        assert_eq!(micros_to_millis(1000), 1);
+        assert_eq!(micros_to_millis(1500), 1);
     }
 }
