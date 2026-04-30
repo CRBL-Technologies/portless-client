@@ -42,6 +42,7 @@ const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 const SEND_WINDOW: u64 = 32 * 1024 * 1024;
+const INITIAL_RTT: Duration = Duration::from_millis(100);
 const STREAM_CANCELLED: VarInt = VarInt::from_u32(0x100);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
@@ -1069,6 +1070,8 @@ fn quic_client_config(identity: &TunnelIdentity) -> Result<quinn::ClientConfig> 
     transport.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
     transport.receive_window(CONNECTION_RECEIVE_WINDOW.into());
     transport.send_window(SEND_WINDOW);
+    transport.initial_rtt(INITIAL_RTT);
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.datagram_receive_buffer_size(None);
     transport.datagram_send_buffer_size(0);
     transport.keep_alive_interval(Some(Duration::from_secs(20)));
