@@ -43,6 +43,12 @@ const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 const SEND_WINDOW: u64 = 32 * 1024 * 1024;
 const STREAM_CANCELLED: VarInt = VarInt::from_u32(0x100);
+const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
+const THROUGHPUT_PATH: &str = "/_portless/throughput";
+const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
+const THROUGHPUT_CHUNK_HEADER: &str = "x-portless-synthetic-chunk";
+const MAX_THROUGHPUT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_THROUGHPUT_CHUNK_BYTES: usize = 1024 * 1024;
 
 pub struct TunnelIdentity {
     ca_pem: String,
@@ -200,6 +206,9 @@ async fn forward_request(
         .await
         .context("read relay request head")?;
     let started = time::Instant::now();
+    if let Some(config) = synthetic_benchmark_config(&request)? {
+        return stream_synthetic_response(request, send, started, config).await;
+    }
     if request.upgrade.is_some() {
         return forward_upgrade_request(http, pms_url, request, send, recv, started).await;
     }
@@ -290,6 +299,136 @@ async fn forward_upgrade_request(
             send_error_response(request.id, err, &mut send).await
         }
     }
+}
+
+fn synthetic_benchmark_config(request: &TunnelRequest) -> Result<Option<SyntheticBenchmarkConfig>> {
+    if request.method != THROUGHPUT_METHOD || request.path_query != THROUGHPUT_PATH {
+        return Ok(None);
+    }
+    if request.upgrade.is_some() {
+        bail!("synthetic throughput benchmark cannot be an upgrade request");
+    }
+    let bytes = synthetic_header(request, THROUGHPUT_BYTES_HEADER)
+        .ok_or_else(|| anyhow!("missing synthetic throughput byte count"))?
+        .parse::<u64>()
+        .context("parse synthetic throughput byte count")?;
+    if bytes == 0 || bytes > MAX_THROUGHPUT_BYTES {
+        bail!("synthetic throughput byte count out of range");
+    }
+    let chunk_bytes = synthetic_header(request, THROUGHPUT_CHUNK_HEADER)
+        .ok_or_else(|| anyhow!("missing synthetic throughput chunk size"))?
+        .parse::<usize>()
+        .context("parse synthetic throughput chunk size")?;
+    if chunk_bytes == 0 || chunk_bytes > MAX_THROUGHPUT_CHUNK_BYTES {
+        bail!("synthetic throughput chunk size out of range");
+    }
+    Ok(Some(SyntheticBenchmarkConfig { bytes, chunk_bytes }))
+}
+
+fn synthetic_header<'a>(request: &'a TunnelRequest, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+async fn stream_synthetic_response(
+    request: TunnelRequest,
+    mut send: SendStream,
+    started: time::Instant,
+    config: SyntheticBenchmarkConfig,
+) -> Result<()> {
+    let request_id = request.id;
+    let method = request.method;
+    let status = 200;
+    let head = TunnelResponseHead {
+        id: request_id.clone(),
+        status,
+        headers: vec![
+            HeaderPair {
+                name: header::CONTENT_TYPE.as_str().to_owned(),
+                value: "application/octet-stream".to_owned(),
+            },
+            HeaderPair {
+                name: header::CONTENT_LENGTH.as_str().to_owned(),
+                value: config.bytes.to_string(),
+            },
+            HeaderPair {
+                name: header::CACHE_CONTROL.as_str().to_owned(),
+                value: "no-store".to_owned(),
+            },
+        ],
+    };
+    if let Err(err) = write_json_frame(&mut send, &head).await {
+        log_daemon_transfer(DaemonTransferLog {
+            request_id: &request_id,
+            method: &method,
+            kind: "synthetic",
+            status,
+            request_bytes: 0,
+            response_bytes: 0,
+            io: DaemonIoMetrics::default(),
+            started,
+            outcome: "write_head_failed",
+        });
+        return Err(err).context("write synthetic response head");
+    }
+
+    let chunk = vec![0_u8; config.chunk_bytes];
+    let mut remaining = config.bytes;
+    let mut response_bytes = 0_u64;
+    let mut io_metrics = DaemonIoMetrics::default();
+    while remaining > 0 {
+        let write_len = remaining.min(chunk.len() as u64) as usize;
+        let quic_write_started = time::Instant::now();
+        let write_result = send.write_all(&chunk[..write_len]).await;
+        io_metrics.quic_write_wait_ms = io_metrics
+            .quic_write_wait_ms
+            .saturating_add(elapsed_millis(quic_write_started));
+        if let Err(err) = write_result {
+            log_daemon_transfer(DaemonTransferLog {
+                request_id: &request_id,
+                method: &method,
+                kind: "synthetic",
+                status,
+                request_bytes: 0,
+                response_bytes,
+                io: io_metrics,
+                started,
+                outcome: "quic_write_failed",
+            });
+            return Err(err).context("write synthetic response body");
+        }
+        remaining -= write_len as u64;
+        response_bytes = response_bytes.saturating_add(write_len as u64);
+    }
+    if let Err(err) = send.finish() {
+        log_daemon_transfer(DaemonTransferLog {
+            request_id: &request_id,
+            method: &method,
+            kind: "synthetic",
+            status,
+            request_bytes: 0,
+            response_bytes,
+            io: io_metrics,
+            started,
+            outcome: "finish_failed",
+        });
+        return Err(err).context("finish synthetic response stream");
+    }
+    log_daemon_transfer(DaemonTransferLog {
+        request_id: &request_id,
+        method: &method,
+        kind: "synthetic",
+        status,
+        request_bytes: 0,
+        response_bytes,
+        io: io_metrics,
+        started,
+        outcome: "ok",
+    });
+    Ok(())
 }
 
 async fn send_local_request(
@@ -1010,6 +1149,11 @@ async fn write_identity_files(
 struct RelayTarget {
     server_name: String,
     addr: SocketAddr,
+}
+
+struct SyntheticBenchmarkConfig {
+    bytes: u64,
+    chunk_bytes: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
