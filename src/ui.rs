@@ -197,6 +197,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .unwrap_or_else(|| "Waiting".to_owned());
     let status_class = status_class(snapshot.status);
     let status_copy = status_label(snapshot.status);
+    let control_status = contract_status_label(snapshot.status.contract_status());
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -284,6 +285,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
             <div class="row"><span>Config generation</span><span>{generation}</span></div>
             <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
             <div class="row"><span>Relay</span><span>{relay}</span></div>
+            <div class="row"><span>Control status</span><span>{control_status}</span></div>
           </div>
         </section>
         <section class="panel" aria-label="Daemon settings">
@@ -320,6 +322,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         generation = escape(&generation),
         tunnel_id = escape(tunnel_id),
         relay = escape(relay),
+        control_status = escape(control_status),
         pms_url = escape(&snapshot.pms_url),
         control_url = escape(&snapshot.control_url),
         data_dir = escape(&snapshot.data_dir),
@@ -360,6 +363,21 @@ fn status_class(status: DaemonStatus) -> &'static str {
         | DaemonStatus::HomeUnreachable
         | DaemonStatus::PlexUnreachable => "bad",
         DaemonStatus::Starting | DaemonStatus::Reconnecting => "wait",
+    }
+}
+
+fn contract_status_label(status: TunnelStatus) -> &'static str {
+    match status {
+        TunnelStatus::Unspecified => "unspecified",
+        TunnelStatus::Starting => "starting",
+        TunnelStatus::Connected => "connected",
+        TunnelStatus::Reconnecting => "reconnecting",
+        TunnelStatus::AuthFailed => "auth_failed",
+        TunnelStatus::CapReached => "cap_reached",
+        TunnelStatus::DeviceRevoked => "device_revoked",
+        TunnelStatus::HomeUnreachable => "home_unreachable",
+        TunnelStatus::PlexUnreachable => "plex_unreachable",
+        TunnelStatus::RelayUnreachable => "relay_unreachable",
     }
 }
 
