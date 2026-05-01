@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use x509_parser::prelude::*;
 
 use crate::{
-    config::Config,
+    config::{Config, KeepaliveProfile},
     control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
 };
 
@@ -121,7 +121,7 @@ pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) ->
         .redirect(Policy::none())
         .build()
         .context("build PMS HTTP client")?;
-    let client_config = quic_client_config(&identity)?;
+    let client_config = quic_client_config(&identity, &cfg.keepalive_profile)?;
     let mut attempt = 0_u32;
 
     loop {
@@ -1062,7 +1062,10 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-fn quic_client_config(identity: &TunnelIdentity) -> Result<quinn::ClientConfig> {
+fn quic_client_config(
+    identity: &TunnelIdentity,
+    keepalive_profile: &KeepaliveProfile,
+) -> Result<quinn::ClientConfig> {
     let mut roots = RootCertStore::empty();
     for cert in parse_certs_pem(&identity.ca_pem)? {
         roots.add(cert).context("add relay CA certificate")?;
@@ -1088,8 +1091,8 @@ fn quic_client_config(identity: &TunnelIdentity) -> Result<quinn::ClientConfig> 
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.datagram_receive_buffer_size(None);
     transport.datagram_send_buffer_size(0);
-    transport.keep_alive_interval(Some(Duration::from_secs(20)));
-    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+    transport.keep_alive_interval(Some(keepalive_profile.quic_keep_alive_interval()));
+    transport.max_idle_timeout(Some(keepalive_profile.quic_max_idle_timeout().try_into()?));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -1346,5 +1349,13 @@ mod tests {
         let capped = reconnect_delay(12);
         assert!(capped >= Duration::from_secs(15));
         assert!(capped < Duration::from_secs(16));
+    }
+
+    #[test]
+    fn residential_keepalive_profile_detects_dead_relay_quickly() {
+        let profile = KeepaliveProfile::Residential;
+
+        assert_eq!(profile.quic_keep_alive_interval(), Duration::from_secs(5));
+        assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(20));
     }
 }
