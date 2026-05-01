@@ -11,7 +11,7 @@ forwards relay HTTP requests to the configured local Plex URL.
 
 - `PORTLESS_DEVICE_TOKEN` - reveal-once daemon token from the admin/control surface.
 - `PORTLESS_PMS_URL` - Plex Media Server URL, default `http://plex:32400`.
-- `PORTLESS_CONTROL_URL` - control-plane URL, default `https://join.portless.io`.
+- `PORTLESS_CONTROL_URL` - daemon bootstrap/control URL, default `https://portless.io`. Do not point this at the Access-protected join/admin hosts.
 - `PORTLESS_DATA_DIR` - daemon state directory, default `/var/lib/portless`.
 - `PORTLESS_KEEPALIVE_PROFILE` - `residential`, `cellular`, or `conservative`.
 - `PORTLESS_UI_ADDR` - local status UI bind address, default `127.0.0.1:43180`; set to `off` to disable.
