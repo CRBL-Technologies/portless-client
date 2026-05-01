@@ -12,6 +12,7 @@ services:
       PORTLESS_CONTROL_URL: ${PORTLESS_CONTROL_URL}
       PORTLESS_DATA_DIR: /var/lib/portless
       PORTLESS_KEEPALIVE_PROFILE: ${PORTLESS_KEEPALIVE_PROFILE:-residential}
+      PORTLESS_UI_ADDR: ${PORTLESS_UI_ADDR:-127.0.0.1:43180}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - portless-daemon-data:/var/lib/portless

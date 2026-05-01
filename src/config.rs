@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -9,6 +9,7 @@ pub struct Config {
     pub control_url: Url,
     pub data_dir: PathBuf,
     pub keepalive_profile: KeepaliveProfile,
+    pub ui_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +54,7 @@ impl Config {
             "conservative" => KeepaliveProfile::Conservative,
             other => return Err(anyhow!("unknown PORTLESS_KEEPALIVE_PROFILE {other:?}")),
         };
+        let ui_addr = parse_ui_addr()?;
 
         Ok(Self {
             device_token,
@@ -60,6 +62,7 @@ impl Config {
             control_url,
             data_dir,
             keepalive_profile,
+            ui_addr,
         })
     }
 }
@@ -67,4 +70,15 @@ impl Config {
 fn parse_url(key: &str, fallback: &str) -> Result<Url> {
     let raw = env::var(key).unwrap_or_else(|_| fallback.to_owned());
     Url::parse(raw.trim()).with_context(|| format!("parse {key}"))
+}
+
+fn parse_ui_addr() -> Result<Option<SocketAddr>> {
+    let raw = env::var("PORTLESS_UI_ADDR").unwrap_or_else(|_| "127.0.0.1:43180".to_owned());
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("disabled") {
+        return Ok(None);
+    }
+    raw.parse()
+        .map(Some)
+        .with_context(|| "parse PORTLESS_UI_ADDR")
 }
