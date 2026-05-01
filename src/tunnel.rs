@@ -37,8 +37,6 @@ use crate::{
 };
 
 const ALPN: &[u8] = b"portless-quic-v1";
-const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
-const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_HEAD: usize = 128 * 1024;
 const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
@@ -125,16 +123,22 @@ pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) ->
     let mut attempt = 0_u32;
 
     loop {
-        let (endpoint, connection) = match connect_once(&device, &client_config, &remote).await {
-            Ok(active) => active,
-            Err(err) => {
-                warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
-                let delay = reconnect_delay(attempt);
-                attempt = attempt.saturating_add(1);
-                time::sleep(delay).await;
-                continue;
-            }
-        };
+        let (endpoint, connection) =
+            match connect_once(&device, &client_config, &remote, &cfg.keepalive_profile).await {
+                Ok(active) => active,
+                Err(err) => {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        relay = %remote.addr,
+                        attempt,
+                        "relay QUIC tunnel disconnected"
+                    );
+                    let delay = reconnect_delay(attempt);
+                    attempt = attempt.saturating_add(1);
+                    time::sleep(delay).await;
+                    continue;
+                }
+            };
 
         attempt = 0;
         match serve_connection(&cfg, &http, endpoint, connection).await {
@@ -151,6 +155,7 @@ async fn connect_once(
     device: &DeviceConfig,
     client_config: &quinn::ClientConfig,
     remote: &RelayTarget,
+    keepalive_profile: &KeepaliveProfile,
 ) -> Result<(Endpoint, Connection)> {
     let bind: SocketAddr = "[::]:0".parse().expect("valid client bind address");
     let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
@@ -158,13 +163,16 @@ async fn connect_once(
     let connecting = endpoint
         .connect(remote.addr, &remote.server_name)
         .context("start QUIC relay connection")?;
-    let connection = time::timeout(QUIC_CONNECT_TIMEOUT, connecting)
+    let connection = time::timeout(keepalive_profile.quic_connect_timeout(), connecting)
         .await
         .context("connect QUIC relay timed out")?
         .context("connect QUIC relay")?;
-    time::timeout(RELAY_HELLO_TIMEOUT, send_hello(&connection, device))
-        .await
-        .context("send relay hello timed out")??;
+    time::timeout(
+        keepalive_profile.relay_hello_timeout(),
+        send_hello(&connection, device),
+    )
+    .await
+    .context("send relay hello timed out")??;
     info!(relay = %remote.addr, server_name = %remote.server_name, "relay QUIC tunnel connected");
     Ok((endpoint, connection))
 }
@@ -1355,7 +1363,9 @@ mod tests {
     fn residential_keepalive_profile_detects_dead_relay_quickly() {
         let profile = KeepaliveProfile::Residential;
 
-        assert_eq!(profile.quic_keep_alive_interval(), Duration::from_secs(5));
-        assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(20));
+        assert_eq!(profile.quic_keep_alive_interval(), Duration::from_secs(3));
+        assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(12));
+        assert_eq!(profile.quic_connect_timeout(), Duration::from_secs(4));
+        assert_eq!(profile.relay_hello_timeout(), Duration::from_secs(5));
     }
 }

@@ -22,7 +22,7 @@ pub enum KeepaliveProfile {
 impl KeepaliveProfile {
     pub fn quic_keep_alive_interval(&self) -> Duration {
         match self {
-            Self::Residential => Duration::from_secs(5),
+            Self::Residential => Duration::from_secs(3),
             Self::Cellular => Duration::from_secs(10),
             Self::Conservative => Duration::from_secs(20),
         }
@@ -30,9 +30,25 @@ impl KeepaliveProfile {
 
     pub fn quic_max_idle_timeout(&self) -> Duration {
         match self {
-            Self::Residential => Duration::from_secs(20),
+            Self::Residential => Duration::from_secs(12),
             Self::Cellular => Duration::from_secs(30),
             Self::Conservative => Duration::from_secs(60),
+        }
+    }
+
+    pub fn quic_connect_timeout(&self) -> Duration {
+        match self {
+            Self::Residential => Duration::from_secs(4),
+            Self::Cellular => Duration::from_secs(8),
+            Self::Conservative => Duration::from_secs(12),
+        }
+    }
+
+    pub fn relay_hello_timeout(&self) -> Duration {
+        match self {
+            Self::Residential => Duration::from_secs(5),
+            Self::Cellular => Duration::from_secs(8),
+            Self::Conservative => Duration::from_secs(10),
         }
     }
 }
