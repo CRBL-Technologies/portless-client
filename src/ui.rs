@@ -1,5 +1,6 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
+use portless_contracts::portless::v1::TunnelStatus;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -28,7 +29,7 @@ struct UiSnapshot {
     public_url: Option<String>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum DaemonStatus {
@@ -41,6 +42,22 @@ pub enum DaemonStatus {
     HomeUnreachable,
     PlexUnreachable,
     RelayUnreachable,
+}
+
+impl DaemonStatus {
+    pub fn contract_status(self) -> TunnelStatus {
+        match self {
+            DaemonStatus::Starting => TunnelStatus::Starting,
+            DaemonStatus::Connected => TunnelStatus::Connected,
+            DaemonStatus::Reconnecting => TunnelStatus::Reconnecting,
+            DaemonStatus::AuthFailed => TunnelStatus::AuthFailed,
+            DaemonStatus::CapReached => TunnelStatus::CapReached,
+            DaemonStatus::DeviceRevoked => TunnelStatus::DeviceRevoked,
+            DaemonStatus::HomeUnreachable => TunnelStatus::HomeUnreachable,
+            DaemonStatus::PlexUnreachable => TunnelStatus::PlexUnreachable,
+            DaemonStatus::RelayUnreachable => TunnelStatus::RelayUnreachable,
+        }
+    }
 }
 
 impl UiState {
@@ -180,6 +197,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .unwrap_or_else(|| "Waiting".to_owned());
     let status_class = status_class(snapshot.status);
     let status_copy = status_label(snapshot.status);
+    let control_status = contract_status_label(snapshot.status.contract_status());
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -267,6 +285,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
             <div class="row"><span>Config generation</span><span>{generation}</span></div>
             <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
             <div class="row"><span>Relay</span><span>{relay}</span></div>
+            <div class="row"><span>Control status</span><span>{control_status}</span></div>
           </div>
         </section>
         <section class="panel" aria-label="Daemon settings">
@@ -303,6 +322,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         generation = escape(&generation),
         tunnel_id = escape(tunnel_id),
         relay = escape(relay),
+        control_status = escape(control_status),
         pms_url = escape(&snapshot.pms_url),
         control_url = escape(&snapshot.control_url),
         data_dir = escape(&snapshot.data_dir),
@@ -346,6 +366,21 @@ fn status_class(status: DaemonStatus) -> &'static str {
     }
 }
 
+fn contract_status_label(status: TunnelStatus) -> &'static str {
+    match status {
+        TunnelStatus::Unspecified => "unspecified",
+        TunnelStatus::Starting => "starting",
+        TunnelStatus::Connected => "connected",
+        TunnelStatus::Reconnecting => "reconnecting",
+        TunnelStatus::AuthFailed => "auth_failed",
+        TunnelStatus::CapReached => "cap_reached",
+        TunnelStatus::DeviceRevoked => "device_revoked",
+        TunnelStatus::HomeUnreachable => "home_unreachable",
+        TunnelStatus::PlexUnreachable => "plex_unreachable",
+        TunnelStatus::RelayUnreachable => "relay_unreachable",
+    }
+}
+
 fn public_url(subdomain: &str, relay_address: &str) -> String {
     let relay = relay_address
         .trim()
@@ -376,6 +411,7 @@ mod tests {
         for (status, expected) in cases {
             let encoded = serde_json::to_string(&status).expect("serialize daemon status");
             assert_eq!(encoded, format!(r#""{expected}""#));
+            assert_ne!(status.contract_status(), TunnelStatus::Unspecified);
         }
     }
 }

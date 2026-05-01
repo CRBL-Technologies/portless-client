@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
+use portless_contracts::portless::v1::QuicApplicationErrorCode;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
@@ -51,7 +52,12 @@ const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 const SEND_WINDOW: u64 = 32 * 1024 * 1024;
 const INITIAL_RTT: Duration = Duration::from_millis(100);
-const STREAM_CANCELLED: VarInt = VarInt::from_u32(0x100);
+const STREAM_CANCELLED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Cancelled as u32);
+const STREAM_RELAY_DRAINING: VarInt =
+    VarInt::from_u32(QuicApplicationErrorCode::RelayDraining as u32);
+const STREAM_QUOTA_EXCEEDED: VarInt =
+    VarInt::from_u32(QuicApplicationErrorCode::QuotaExceeded as u32);
+const STREAM_REVOKED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Revoked as u32);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
 const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
@@ -158,17 +164,23 @@ pub async fn run(
 
         attempt = 0;
         ui.set_status(DaemonStatus::Connected).await;
-        match serve_connection(&cfg, &http, endpoint, connection, ui.clone()).await {
-            Ok(()) => {
-                ui.set_status(DaemonStatus::Reconnecting).await;
-                warn!(relay = %remote.addr, "relay QUIC tunnel closed");
+        let delay = match serve_connection(&cfg, &http, endpoint, connection, ui.clone()).await {
+            Ok(status) => {
+                ui.set_status(status).await;
+                warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
+                if terminal_close_status(status) {
+                    Duration::from_secs(60)
+                } else {
+                    reconnect_delay(0)
+                }
             }
             Err(err) => {
                 ui.set_status(DaemonStatus::Reconnecting).await;
                 warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
+                reconnect_delay(0)
             }
-        }
-        time::sleep(reconnect_delay(0)).await;
+        };
+        time::sleep(delay).await;
     }
 }
 
@@ -204,7 +216,7 @@ async fn serve_connection(
     _endpoint: Endpoint,
     connection: Connection,
     ui: UiState,
-) -> Result<()> {
+) -> Result<DaemonStatus> {
     loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
@@ -217,10 +229,31 @@ async fn serve_connection(
                     }
                 });
             }
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => return Ok(()),
+            Err(quinn::ConnectionError::ApplicationClosed(close)) => {
+                return Ok(status_for_application_close(close.error_code));
+            }
             Err(err) => return Err(err).context("accept QUIC request stream"),
         }
     }
+}
+
+fn status_for_application_close(error_code: VarInt) -> DaemonStatus {
+    if error_code == STREAM_QUOTA_EXCEEDED {
+        DaemonStatus::CapReached
+    } else if error_code == STREAM_REVOKED {
+        DaemonStatus::DeviceRevoked
+    } else if error_code == STREAM_RELAY_DRAINING || error_code == STREAM_CANCELLED {
+        DaemonStatus::Reconnecting
+    } else {
+        DaemonStatus::RelayUnreachable
+    }
+}
+
+fn terminal_close_status(status: DaemonStatus) -> bool {
+    matches!(
+        status,
+        DaemonStatus::CapReached | DaemonStatus::DeviceRevoked
+    )
 }
 
 async fn send_hello(connection: &Connection, device: &DeviceConfig) -> Result<()> {
@@ -1472,6 +1505,29 @@ mod tests {
         assert!(got
             .iter()
             .any(|header| header.name == "accept" && header.value == "text/html"));
+    }
+
+    #[test]
+    fn application_close_codes_match_contract_statuses() {
+        assert_eq!(
+            u64::from(STREAM_CANCELLED),
+            QuicApplicationErrorCode::Cancelled as u64
+        );
+        assert_eq!(
+            status_for_application_close(STREAM_QUOTA_EXCEEDED),
+            DaemonStatus::CapReached
+        );
+        assert_eq!(
+            status_for_application_close(STREAM_REVOKED),
+            DaemonStatus::DeviceRevoked
+        );
+        assert_eq!(
+            status_for_application_close(STREAM_RELAY_DRAINING),
+            DaemonStatus::Reconnecting
+        );
+        assert!(terminal_close_status(DaemonStatus::CapReached));
+        assert!(terminal_close_status(DaemonStatus::DeviceRevoked));
+        assert!(!terminal_close_status(DaemonStatus::Reconnecting));
     }
 
     #[test]
