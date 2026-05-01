@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     state.relay_address = Some(device.relay_address.clone());
     state.save(&cfg.data_dir).await?;
     ui_state.set_device(&device).await;
-    ui_state.set_status(DaemonStatus::Connecting).await;
+    ui_state.set_status(DaemonStatus::Reconnecting).await;
     let identity = tunnel::ensure_identity(&cfg, &control, &device, &trust).await?;
 
     tokio::select! {

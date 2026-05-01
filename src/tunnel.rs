@@ -137,7 +137,7 @@ pub async fn run(
     let mut attempt = 0_u32;
 
     loop {
-        ui.set_status(DaemonStatus::Connecting).await;
+        ui.set_status(DaemonStatus::Reconnecting).await;
         let (endpoint, connection) =
             match connect_once(&device, &client_config, &remote, &cfg.keepalive_profile).await {
                 Ok(active) => active,
@@ -160,11 +160,11 @@ pub async fn run(
         ui.set_status(DaemonStatus::Connected).await;
         match serve_connection(&cfg, &http, endpoint, connection, ui.clone()).await {
             Ok(()) => {
-                ui.set_status(DaemonStatus::RelayDisconnected).await;
+                ui.set_status(DaemonStatus::Reconnecting).await;
                 warn!(relay = %remote.addr, "relay QUIC tunnel closed");
             }
             Err(err) => {
-                ui.set_status(DaemonStatus::RelayDisconnected).await;
+                ui.set_status(DaemonStatus::Reconnecting).await;
                 warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
             }
         }
@@ -283,7 +283,7 @@ async fn forward_request(
             .await
         }
         Err(err) => {
-            ui.set_status(DaemonStatus::PmsUnreachable).await;
+            ui.set_status(DaemonStatus::PlexUnreachable).await;
             warn!(
                 request_id = %request.id,
                 method = %request.method,
@@ -336,7 +336,7 @@ async fn forward_upgrade_request(
             .await
         }
         Err(err) => {
-            ui.set_status(DaemonStatus::PmsUnreachable).await;
+            ui.set_status(DaemonStatus::PlexUnreachable).await;
             warn!(
                 request_id = %request.id,
                 method = %request.method,
