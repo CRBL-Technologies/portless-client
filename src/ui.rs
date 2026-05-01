@@ -30,6 +30,7 @@ struct UiSnapshot {
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum DaemonStatus {
     Starting,
     Connected,
