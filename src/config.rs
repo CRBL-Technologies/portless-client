@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -17,16 +17,6 @@ pub enum KeepaliveProfile {
     Residential,
     Cellular,
     Conservative,
-}
-
-impl KeepaliveProfile {
-    pub fn interval(&self) -> Duration {
-        match self {
-            Self::Residential => Duration::from_secs(20),
-            Self::Cellular => Duration::from_secs(12),
-            Self::Conservative => Duration::from_secs(30),
-        }
-    }
 }
 
 impl Config {

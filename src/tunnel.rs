@@ -37,6 +37,8 @@ use crate::{
 };
 
 const ALPN: &[u8] = b"portless-quic-v1";
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_HEAD: usize = 128 * 1024;
 const MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
@@ -123,39 +125,56 @@ pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) ->
     let mut attempt = 0_u32;
 
     loop {
-        match run_once(&cfg, &device, &http, &client_config, &remote).await {
-            Ok(()) => {
-                attempt = 0;
-                warn!(relay = %remote.addr, "relay QUIC tunnel closed");
+        let (endpoint, connection) = match connect_once(&device, &client_config, &remote).await {
+            Ok(active) => active,
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
+                let delay = reconnect_delay(attempt);
+                attempt = attempt.saturating_add(1);
+                time::sleep(delay).await;
+                continue;
             }
+        };
+
+        attempt = 0;
+        match serve_connection(&cfg, &http, endpoint, connection).await {
+            Ok(()) => warn!(relay = %remote.addr, "relay QUIC tunnel closed"),
             Err(err) => {
                 warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
             }
         }
-        let delay = reconnect_delay(&cfg, attempt);
-        attempt = attempt.saturating_add(1);
-        time::sleep(delay).await;
+        time::sleep(reconnect_delay(0)).await;
     }
 }
 
-async fn run_once(
-    cfg: &Config,
+async fn connect_once(
     device: &DeviceConfig,
-    http: &Client,
     client_config: &quinn::ClientConfig,
     remote: &RelayTarget,
-) -> Result<()> {
+) -> Result<(Endpoint, Connection)> {
     let bind: SocketAddr = "[::]:0".parse().expect("valid client bind address");
     let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
     endpoint.set_default_client_config(client_config.clone());
-    let connection = endpoint
+    let connecting = endpoint
         .connect(remote.addr, &remote.server_name)
-        .context("start QUIC relay connection")?
+        .context("start QUIC relay connection")?;
+    let connection = time::timeout(QUIC_CONNECT_TIMEOUT, connecting)
         .await
+        .context("connect QUIC relay timed out")?
         .context("connect QUIC relay")?;
-    send_hello(&connection, device).await?;
+    time::timeout(RELAY_HELLO_TIMEOUT, send_hello(&connection, device))
+        .await
+        .context("send relay hello timed out")??;
     info!(relay = %remote.addr, server_name = %remote.server_name, "relay QUIC tunnel connected");
+    Ok((endpoint, connection))
+}
 
+async fn serve_connection(
+    cfg: &Config,
+    http: &Client,
+    _endpoint: Endpoint,
+    connection: Connection,
+) -> Result<()> {
     loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
@@ -952,19 +971,14 @@ fn micros_to_millis(value: u64) -> u64 {
     value / 1000
 }
 
-fn reconnect_delay(cfg: &Config, attempt: u32) -> Duration {
-    let base = cfg
-        .keepalive_profile
-        .interval()
-        .min(Duration::from_secs(30));
+fn reconnect_delay(attempt: u32) -> Duration {
+    let base = Duration::from_secs(1);
     let multiplier = 1_u32 << attempt.min(5);
-    let capped = base
-        .saturating_mul(multiplier)
-        .min(Duration::from_secs(120));
-    capped + reconnect_jitter(attempt, base)
+    let capped = base.saturating_mul(multiplier).min(Duration::from_secs(15));
+    capped + reconnect_jitter(attempt)
 }
 
-fn reconnect_jitter(attempt: u32, base: Duration) -> Duration {
+fn reconnect_jitter(attempt: u32) -> Duration {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -972,7 +986,7 @@ fn reconnect_jitter(attempt: u32, base: Duration) -> Duration {
     let mut hasher = DefaultHasher::new();
     now.hash(&mut hasher);
     attempt.hash(&mut hasher);
-    let jitter_ms = hasher.finish() % (base.as_millis().max(1) as u64);
+    let jitter_ms = hasher.finish() % 1000;
     Duration::from_millis(jitter_ms)
 }
 
@@ -1321,5 +1335,16 @@ mod tests {
         assert_eq!(micros_to_millis(999), 0);
         assert_eq!(micros_to_millis(1000), 1);
         assert_eq!(micros_to_millis(1500), 1);
+    }
+
+    #[test]
+    fn reconnect_delay_stays_short_and_bounded() {
+        let first = reconnect_delay(0);
+        assert!(first >= Duration::from_secs(1));
+        assert!(first < Duration::from_secs(2));
+
+        let capped = reconnect_delay(12);
+        assert!(capped >= Duration::from_secs(15));
+        assert!(capped < Duration::from_secs(16));
     }
 }
