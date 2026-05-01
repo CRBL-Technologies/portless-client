@@ -15,10 +15,14 @@ forwards relay HTTP requests to the configured local Plex URL.
 - `PORTLESS_DATA_DIR` - daemon state directory, default `/var/lib/portless`.
 - `PORTLESS_KEEPALIVE_PROFILE` - `residential`, `cellular`, or `conservative`.
 - `PORTLESS_UI_ADDR` - local status UI bind address, default `127.0.0.1:43180`; set to `off` to disable.
+- `PORTLESS_DEVICE_KEY_SECRET` - optional external secret for encrypting the
+  daemon private key. If unset, the daemon creates `device.key.secret` under
+  `PORTLESS_DATA_DIR` and stores only `device.key.pem.enc` for the key itself.
 
 The client status UI exposes the current tunnel identity and daemon settings on
-`/`, plus machine-readable status on `/status.json`. It never displays the
-device token.
+`/`, plus machine-readable status on `/status.json`. Status values distinguish
+startup, relay reachability, relay disconnects, and local PMS reachability. The
+UI never displays the device token.
 
 ## Local Compose
 

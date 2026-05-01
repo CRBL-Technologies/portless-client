@@ -8,9 +8,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
 use anyhow::{anyhow, bail, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -34,6 +41,7 @@ use x509_parser::prelude::*;
 use crate::{
     config::{Config, KeepaliveProfile},
     control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
+    ui::{DaemonStatus, UiState},
 };
 
 const ALPN: &[u8] = b"portless-quic-v1";
@@ -50,6 +58,11 @@ const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
 const THROUGHPUT_CHUNK_HEADER: &str = "x-portless-synthetic-chunk";
 const MAX_THROUGHPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_THROUGHPUT_CHUNK_BYTES: usize = 1024 * 1024;
+const DEVICE_KEY_SECRET_FILE: &str = "device.key.secret";
+const DEVICE_KEY_ENCRYPTED_FILE: &str = "device.key.pem.enc";
+const DEVICE_KEY_PLAINTEXT_FILE: &str = "device.key.pem";
+const DEVICE_KEY_SECRET_ENV: &str = "PORTLESS_DEVICE_KEY_SECRET";
+const DEVICE_KEY_AAD: &[u8] = b"portless-device-key-v1";
 
 pub struct TunnelIdentity {
     ca_pem: String,
@@ -66,15 +79,10 @@ pub async fn ensure_identity(
     fs::create_dir_all(&cfg.data_dir)
         .await
         .context("create daemon data dir")?;
-    let key_path = cfg.data_dir.join("device.key.pem");
     let cert_path = cfg.data_dir.join("device.cert.pem");
     let trust_path = cfg.data_dir.join("trust.pem");
 
-    let existing_key = match fs::read_to_string(&key_path).await {
-        Ok(raw) => Some(raw),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err).context("read daemon key"),
-    };
+    let existing_key = read_device_key(&cfg.data_dir).await?;
     let existing_cert = match fs::read_to_string(&cert_path).await {
         Ok(raw) => Some(raw),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -82,6 +90,7 @@ pub async fn ensure_identity(
     };
     if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
         if !certificate_needs_renewal(cert_pem, &device.tunnel_id) {
+            write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
             fs::write(&trust_path, &trust.pem)
                 .await
                 .context("write trust bundle")?;
@@ -113,7 +122,12 @@ pub async fn ensure_identity(
     })
 }
 
-pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) -> Result<()> {
+pub async fn run(
+    cfg: Config,
+    device: DeviceConfig,
+    identity: TunnelIdentity,
+    ui: UiState,
+) -> Result<()> {
     let remote = relay_target(&device.relay_address).await?;
     let http = Client::builder()
         .redirect(Policy::none())
@@ -123,10 +137,12 @@ pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) ->
     let mut attempt = 0_u32;
 
     loop {
+        ui.set_status(DaemonStatus::Connecting).await;
         let (endpoint, connection) =
             match connect_once(&device, &client_config, &remote, &cfg.keepalive_profile).await {
                 Ok(active) => active,
                 Err(err) => {
+                    ui.set_status(DaemonStatus::RelayUnreachable).await;
                     warn!(
                         error = %format!("{err:#}"),
                         relay = %remote.addr,
@@ -141,9 +157,14 @@ pub async fn run(cfg: Config, device: DeviceConfig, identity: TunnelIdentity) ->
             };
 
         attempt = 0;
-        match serve_connection(&cfg, &http, endpoint, connection).await {
-            Ok(()) => warn!(relay = %remote.addr, "relay QUIC tunnel closed"),
+        ui.set_status(DaemonStatus::Connected).await;
+        match serve_connection(&cfg, &http, endpoint, connection, ui.clone()).await {
+            Ok(()) => {
+                ui.set_status(DaemonStatus::RelayDisconnected).await;
+                warn!(relay = %remote.addr, "relay QUIC tunnel closed");
+            }
             Err(err) => {
+                ui.set_status(DaemonStatus::RelayDisconnected).await;
                 warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
             }
         }
@@ -182,14 +203,16 @@ async fn serve_connection(
     http: &Client,
     _endpoint: Endpoint,
     connection: Connection,
+    ui: UiState,
 ) -> Result<()> {
     loop {
         match connection.accept_bi().await {
             Ok((send, recv)) => {
                 let http = http.clone();
                 let pms_url = cfg.pms_url.clone();
+                let ui = ui.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = forward_request(http, pms_url, send, recv).await {
+                    if let Err(err) = forward_request(http, pms_url, send, recv, ui).await {
                         warn!(error = %format!("{err:#}"), "forward QUIC request failed");
                     }
                 });
@@ -229,6 +252,7 @@ async fn forward_request(
     pms_url: Url,
     send: SendStream,
     mut recv: RecvStream,
+    ui: UiState,
 ) -> Result<()> {
     let request: TunnelRequest = read_json_frame(&mut recv)
         .await
@@ -238,13 +262,14 @@ async fn forward_request(
         return stream_synthetic_response(request, send, started, config).await;
     }
     if request.upgrade.is_some() {
-        return forward_upgrade_request(http, pms_url, request, send, recv, started).await;
+        return forward_upgrade_request(http, pms_url, request, send, recv, started, ui).await;
     }
 
     let body = quic_request_body(recv);
     let mut send = send;
     match send_local_request(&http, &pms_url, &request, body).await {
         Ok(response) => {
+            ui.set_status(DaemonStatus::Connected).await;
             let rewrite = RedirectRewrite::from_request(&pms_url, &request.headers);
             stream_local_response(
                 request.id,
@@ -258,6 +283,7 @@ async fn forward_request(
             .await
         }
         Err(err) => {
+            ui.set_status(DaemonStatus::PmsUnreachable).await;
             warn!(
                 request_id = %request.id,
                 method = %request.method,
@@ -287,13 +313,16 @@ async fn forward_upgrade_request(
     mut send: SendStream,
     recv: RecvStream,
     started: time::Instant,
+    ui: UiState,
 ) -> Result<()> {
     match send_local_upgrade_request(&http, &pms_url, &request).await {
         Ok(response) if response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS => {
+            ui.set_status(DaemonStatus::Connected).await;
             stream_local_upgrade_response(request.id, request.method, response, send, recv, started)
                 .await
         }
         Ok(response) => {
+            ui.set_status(DaemonStatus::Connected).await;
             let rewrite = RedirectRewrite::from_request(&pms_url, &request.headers);
             stream_local_response(
                 request.id,
@@ -307,6 +336,7 @@ async fn forward_upgrade_request(
             .await
         }
         Err(err) => {
+            ui.set_status(DaemonStatus::PmsUnreachable).await;
             warn!(
                 request_id = %request.id,
                 method = %request.method,
@@ -1052,6 +1082,7 @@ fn is_hop_by_hop_response(name: &HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
+            | "content-length"
     )
 }
 
@@ -1123,6 +1154,167 @@ fn parse_private_key_pem(raw: &str) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow!("private key PEM did not contain a private key"))
 }
 
+async fn read_device_key(data_dir: &Path) -> Result<Option<String>> {
+    let encrypted_path = data_dir.join(DEVICE_KEY_ENCRYPTED_FILE);
+    match fs::read_to_string(&encrypted_path).await {
+        Ok(raw) => return decrypt_device_key(data_dir, &raw).await.map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("read encrypted daemon key"),
+    }
+
+    let plaintext_path = data_dir.join(DEVICE_KEY_PLAINTEXT_FILE);
+    match fs::read_to_string(&plaintext_path).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).context("read plaintext daemon key"),
+    }
+}
+
+async fn write_encrypted_device_key(data_dir: &Path, key_pem: &str) -> Result<()> {
+    let secret = read_or_create_device_key_secret(data_dir).await?;
+    let mut salt = [0_u8; 16];
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce);
+    let key = derive_device_key(&secret, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow!("build daemon key cipher: invalid key length"))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: key_pem.as_bytes(),
+                aad: DEVICE_KEY_AAD,
+            },
+        )
+        .map_err(|_| anyhow!("encrypt daemon private key"))?;
+    let envelope = EncryptedDeviceKey {
+        version: 1,
+        kdf: "argon2id".to_owned(),
+        cipher: "aes-256-gcm".to_owned(),
+        salt: BASE64_STANDARD.encode(salt),
+        nonce: BASE64_STANDARD.encode(nonce),
+        ciphertext: BASE64_STANDARD.encode(ciphertext),
+    };
+    let encoded = serde_json::to_string_pretty(&envelope).context("encode encrypted daemon key")?;
+    fs::write(data_dir.join(DEVICE_KEY_ENCRYPTED_FILE), encoded)
+        .await
+        .context("write encrypted daemon key")?;
+    match fs::remove_file(data_dir.join(DEVICE_KEY_PLAINTEXT_FILE)).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("remove plaintext daemon key"),
+    }
+    Ok(())
+}
+
+async fn decrypt_device_key(data_dir: &Path, raw: &str) -> Result<String> {
+    let secret = read_device_key_secret(data_dir).await?;
+    let envelope: EncryptedDeviceKey =
+        serde_json::from_str(raw).context("decode encrypted daemon key")?;
+    if envelope.version != 1 || envelope.kdf != "argon2id" || envelope.cipher != "aes-256-gcm" {
+        bail!("unsupported encrypted daemon key envelope");
+    }
+    let salt = BASE64_STANDARD
+        .decode(envelope.salt)
+        .context("decode daemon key salt")?;
+    let nonce = BASE64_STANDARD
+        .decode(envelope.nonce)
+        .context("decode daemon key nonce")?;
+    let ciphertext = BASE64_STANDARD
+        .decode(envelope.ciphertext)
+        .context("decode daemon key ciphertext")?;
+    let key = derive_device_key(&secret, &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| anyhow!("build daemon key cipher: invalid key length"))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad: DEVICE_KEY_AAD,
+            },
+        )
+        .map_err(|_| anyhow!("decrypt daemon private key"))?;
+    String::from_utf8(plaintext).context("daemon private key is not UTF-8")
+}
+
+async fn read_or_create_device_key_secret(data_dir: &Path) -> Result<Vec<u8>> {
+    if let Ok(raw) = std::env::var(DEVICE_KEY_SECRET_ENV) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("{DEVICE_KEY_SECRET_ENV} is empty");
+        }
+        return Ok(trimmed.as_bytes().to_vec());
+    }
+
+    match read_device_key_secret(data_dir).await {
+        Ok(secret) => Ok(secret),
+        Err(err) if is_not_found(&err) => {
+            let mut secret = [0_u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            let path = data_dir.join(DEVICE_KEY_SECRET_FILE);
+            write_secret_file(&path, &secret).await?;
+            Ok(secret.to_vec())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn read_device_key_secret(data_dir: &Path) -> Result<Vec<u8>> {
+    if let Ok(raw) = std::env::var(DEVICE_KEY_SECRET_ENV) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("{DEVICE_KEY_SECRET_ENV} is empty");
+        }
+        return Ok(trimmed.as_bytes().to_vec());
+    }
+
+    let path = data_dir.join(DEVICE_KEY_SECRET_FILE);
+    let raw = fs::read(&path).await.context("read daemon key secret")?;
+    let trimmed = String::from_utf8_lossy(&raw).trim().to_owned();
+    if trimmed.is_empty() {
+        bail!("daemon key secret is empty");
+    }
+    BASE64_STANDARD
+        .decode(trimmed)
+        .context("decode daemon key secret")
+}
+
+async fn write_secret_file(path: &Path, secret: &[u8]) -> Result<()> {
+    fs::write(path, BASE64_STANDARD.encode(secret))
+        .await
+        .context("write daemon key secret")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .await
+            .context("restrict daemon key secret permissions")?;
+    }
+    Ok(())
+}
+
+fn derive_device_key(secret: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
+    let params = Params::new(19 * 1024, 2, 1, Some(32))
+        .map_err(|err| anyhow!("build Argon2id params: {err}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0_u8; 32];
+    argon2
+        .hash_password_into(secret, salt, &mut key)
+        .map_err(|err| anyhow!("derive daemon key encryption key: {err}"))?;
+    Ok(key)
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 fn device_csr_pem(device: &DeviceConfig, key_pair: &KeyPair) -> Result<String> {
     let mut params = CertificateParams::new(vec![device.subdomain.clone()])
         .context("build daemon certificate parameters")?;
@@ -1160,8 +1352,8 @@ fn certificate_needs_renewal(cert_pem: &str, tunnel_id: &str) -> bool {
 fn renewal_threshold_seconds(tunnel_id: &str) -> i64 {
     let mut hasher = DefaultHasher::new();
     tunnel_id.hash(&mut hasher);
-    let jitter = (hasher.finish() % (24 * 60 * 60)) as i64;
-    (10 * 24 * 60 * 60) + jitter
+    let jitter = (hasher.finish() % (2 * 60 * 60)) as i64;
+    (16 * 60 * 60) + jitter
 }
 
 async fn write_identity_files(
@@ -1170,9 +1362,7 @@ async fn write_identity_files(
     issued: &CertificateResponse,
     trust_pem: &str,
 ) -> Result<()> {
-    fs::write(data_dir.join("device.key.pem"), key_pem)
-        .await
-        .context("write daemon private key")?;
+    write_encrypted_device_key(data_dir, key_pem).await?;
     fs::write(data_dir.join("device.cert.pem"), &issued.certificate_pem)
         .await
         .context("write daemon certificate")?;
@@ -1190,6 +1380,16 @@ struct RelayTarget {
 struct SyntheticBenchmarkConfig {
     bytes: u64,
     chunk_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EncryptedDeviceKey {
+    version: u8,
+    kdf: String,
+    cipher: String,
+    salt: String,
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1339,6 +1539,63 @@ mod tests {
         assert!(got
             .iter()
             .any(|header| header.name == "sec-websocket-accept"));
+    }
+
+    #[test]
+    fn strips_streaming_response_length_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "1234".parse().unwrap());
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+
+        let got = serializable_response_headers(&headers, false, None);
+
+        assert_eq!(got.len(), 1);
+        assert!(got.iter().any(|header| header.name == "content-type"));
+        assert!(!got.iter().any(|header| header.name == "content-length"));
+        assert!(!got.iter().any(|header| header.name == "transfer-encoding"));
+    }
+
+    #[test]
+    fn renewal_threshold_fits_24_hour_certificates() {
+        let threshold = renewal_threshold_seconds("tunnel-123");
+
+        assert!(threshold >= 16 * 60 * 60);
+        assert!(threshold < 18 * 60 * 60);
+    }
+
+    #[tokio::test]
+    async fn encrypted_key_storage_migrates_plaintext_key() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portless-key-test-{nonce}"));
+        fs::create_dir_all(&dir).await.unwrap();
+        fs::write(dir.join(DEVICE_KEY_PLAINTEXT_FILE), "test-private-key")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_device_key(&dir).await.unwrap().unwrap(),
+            "test-private-key"
+        );
+        write_encrypted_device_key(&dir, "test-private-key")
+            .await
+            .unwrap();
+
+        assert!(fs::metadata(dir.join(DEVICE_KEY_PLAINTEXT_FILE))
+            .await
+            .is_err());
+        assert!(fs::metadata(dir.join(DEVICE_KEY_ENCRYPTED_FILE))
+            .await
+            .is_ok());
+        assert_eq!(
+            read_device_key(&dir).await.unwrap().unwrap(),
+            "test-private-key"
+        );
+
+        fs::remove_dir_all(&dir).await.unwrap();
     }
 
     #[test]
