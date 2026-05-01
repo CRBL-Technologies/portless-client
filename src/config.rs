@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -17,6 +17,24 @@ pub enum KeepaliveProfile {
     Residential,
     Cellular,
     Conservative,
+}
+
+impl KeepaliveProfile {
+    pub fn quic_keep_alive_interval(&self) -> Duration {
+        match self {
+            Self::Residential => Duration::from_secs(5),
+            Self::Cellular => Duration::from_secs(10),
+            Self::Conservative => Duration::from_secs(20),
+        }
+    }
+
+    pub fn quic_max_idle_timeout(&self) -> Duration {
+        match self {
+            Self::Residential => Duration::from_secs(20),
+            Self::Cellular => Duration::from_secs(30),
+            Self::Conservative => Duration::from_secs(60),
+        }
+    }
 }
 
 impl Config {
