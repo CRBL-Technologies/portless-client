@@ -6,6 +6,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - portless-data:/var/lib/portless
+    ports:
+      - "127.0.0.1:43180:43180"
     depends_on:
       plex:
         condition: service_started

@@ -2,12 +2,14 @@ mod config;
 mod control;
 mod state;
 mod tunnel;
+mod ui;
 
 use anyhow::Result;
 use config::Config;
 use control::ControlClient;
 use state::DaemonState;
 use tracing::info;
+use ui::UiState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +20,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
+    let ui_state = UiState::new(&cfg);
+    if let Some(addr) = cfg.ui_addr {
+        tokio::spawn(ui::serve(addr, ui_state.clone()));
+    }
     let control = ControlClient::new(cfg.control_url.clone(), cfg.device_token.clone());
 
     info!(
@@ -45,6 +51,7 @@ async fn main() -> Result<()> {
     state.config_generation = Some(device.config_generation);
     state.relay_address = Some(device.relay_address.clone());
     state.save(&cfg.data_dir).await?;
+    ui_state.set_device(&device).await;
     let identity = tunnel::ensure_identity(&cfg, &control, &device, &trust).await?;
 
     tokio::select! {
