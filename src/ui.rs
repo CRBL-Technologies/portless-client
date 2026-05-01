@@ -149,49 +149,79 @@ async fn write_response(
 }
 
 fn render_html(snapshot: &UiSnapshot) -> String {
-    let public_url = snapshot.public_url.as_deref().unwrap_or("Pending config");
-    let tunnel_id = snapshot.tunnel_id.as_deref().unwrap_or("Pending");
-    let subdomain = snapshot.subdomain.as_deref().unwrap_or("Pending");
-    let relay = snapshot.relay_address.as_deref().unwrap_or("Pending");
+    let public_url = snapshot
+        .public_url
+        .as_deref()
+        .unwrap_or("Waiting for device config");
+    let tunnel_id = snapshot.tunnel_id.as_deref().unwrap_or("Waiting");
+    let subdomain = snapshot.subdomain.as_deref().unwrap_or("Waiting");
+    let relay = snapshot.relay_address.as_deref().unwrap_or("Waiting");
     let generation = snapshot
         .config_generation
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "Pending".to_owned());
+        .unwrap_or_else(|| "Waiting".to_owned());
+    let connected = snapshot.status == "connected";
+    let status_class = if connected { "ok" } else { "wait" };
+    let status_copy = if connected { "Connected" } else { "Starting" };
     format!(
         r#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Portless Client</title>
+    <title>Portless client</title>
     <style>
-      :root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #17202a; background: #f4f7f5; }}
+      :root {{
+        color-scheme: light;
+        --canvas: #FFFBF5;
+        --surface: #FFF7ED;
+        --surface-strong: #FFFFFF;
+        --text: #1C1917;
+        --muted: #78716C;
+        --border: #E7D8C4;
+        --border-strong: #D6BFA1;
+        --accent: #D97706;
+        --accent-hover: #B45309;
+        --accent-soft: #FEF3C7;
+        --ok: #15803D;
+        --ok-soft: #DCFCE7;
+        --wait: #92400E;
+        --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background: var(--canvas);
+      }}
       * {{ box-sizing: border-box; }}
-      body {{ min-width: 320px; margin: 0; background: #f4f7f5; }}
-      main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 44px; }}
+      body {{ min-width: 320px; margin: 0; background: var(--canvas); }}
+      main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 48px; }}
       header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }}
-      h1 {{ margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: 0; }}
-      .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid #a8d5ba; border-radius: 999px; background: #e7f5ed; color: #126339; font-weight: 700; }}
-      .dot {{ width: 8px; height: 8px; border-radius: 50%; background: #20a464; }}
-      .layout {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, .8fr); gap: 14px; }}
-      section {{ border: 1px solid #d7e1db; border-radius: 8px; background: #fff; box-shadow: 0 1px 2px rgb(15 23 42 / 6%); }}
-      .primary {{ padding: 22px; }}
-      h2 {{ margin: 0 0 10px; font-size: 18px; letter-spacing: 0; }}
-      .url {{ display: block; width: 100%; overflow-wrap: anywhere; padding: 14px; border: 1px solid #d7e1db; border-radius: 8px; background: #f8faf9; color: #17202a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; }}
-      .meta {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }}
-      .item {{ padding: 12px; border: 1px solid #e3e9e5; border-radius: 8px; background: #fbfcfb; }}
-      .label {{ margin: 0 0 5px; color: #65736b; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
-      .value {{ margin: 0; overflow-wrap: anywhere; font-size: 14px; }}
-      .side {{ display: grid; gap: 0; }}
-      .row {{ display: grid; grid-template-columns: 122px minmax(0, 1fr); gap: 10px; padding: 14px; border-bottom: 1px solid #e3e9e5; }}
-      .row:last-child {{ border-bottom: 0; }}
-      .row span:first-child {{ color: #65736b; font-weight: 700; }}
+      h1 {{ margin: 0; font-family: var(--mono); font-size: 28px; line-height: 1.15; letter-spacing: 0; }}
+      h1 span {{ color: var(--accent); }}
+      h2 {{ margin: 0; font-size: 24px; line-height: 1.18; letter-spacing: 0; }}
+      h3 {{ margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: 0; }}
+      p {{ margin: 0; color: var(--muted); line-height: 1.55; }}
+      button {{ display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-strong); color: var(--text); font: inherit; font-weight: 800; cursor: pointer; }}
+      button:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+      .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-weight: 700; }}
+      .status.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
+      .status.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
+      .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
+      .layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; }}
+      section {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
+      .panel {{ display: grid; gap: 16px; align-content: start; padding: 22px; }}
+      .url-wrap {{ display: grid; gap: 10px; }}
+      .url {{ display: block; width: 100%; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-strong); color: var(--text); font-family: var(--mono); font-size: 15px; }}
+      .meta {{ display: grid; gap: 0; }}
+      .row {{ display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 10px; padding: 12px 0; border-top: 1px solid var(--border); }}
+      .row:first-child {{ border-top: 0; }}
+      .row span:first-child {{ color: var(--muted); font-weight: 800; }}
       .row span:last-child {{ overflow-wrap: anywhere; }}
+      .note {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface-strong); padding: 12px; }}
       @media (max-width: 780px) {{
         main {{ width: min(100vw - 20px, 1120px); padding-top: 16px; }}
         header {{ align-items: flex-start; flex-direction: column; }}
         h1 {{ font-size: 24px; }}
-        .layout, .meta {{ grid-template-columns: 1fr; }}
+        .layout {{ grid-template-columns: 1fr; }}
         .row {{ grid-template-columns: 1fr; gap: 4px; }}
       }}
     </style>
@@ -199,31 +229,55 @@ fn render_html(snapshot: &UiSnapshot) -> String {
   <body>
     <main>
       <header>
-        <h1>Portless Client</h1>
-        <div class="status"><span class="dot" aria-hidden="true"></span>{status}</div>
+        <h1><span>P</span>ortless client</h1>
+        <div class="status {status_class}"><span class="dot" aria-hidden="true"></span>{status_copy}</div>
       </header>
       <div class="layout">
-        <section class="primary">
-          <h2>Public tunnel</h2>
-          <code class="url">{public_url}</code>
+        <section class="panel">
+          <div>
+            <h2>Public tunnel</h2>
+            <p>This is the customer URL served through Portless when the daemon is connected.</p>
+          </div>
+          <div class="url-wrap">
+            <code id="public-url" class="url">{public_url}</code>
+            <button type="button" data-copy="public-url">Copy public URL</button>
+          </div>
           <div class="meta">
-            <div class="item"><p class="label">Subdomain</p><p class="value">{subdomain}</p></div>
-            <div class="item"><p class="label">Config generation</p><p class="value">{generation}</p></div>
-            <div class="item"><p class="label">Tunnel ID</p><p class="value">{tunnel_id}</p></div>
-            <div class="item"><p class="label">Relay</p><p class="value">{relay}</p></div>
+            <div class="row"><span>Subdomain</span><span>{subdomain}</span></div>
+            <div class="row"><span>Config generation</span><span>{generation}</span></div>
+            <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
+            <div class="row"><span>Relay</span><span>{relay}</span></div>
           </div>
         </section>
-        <section class="side" aria-label="Daemon settings">
+        <section class="panel" aria-label="Daemon settings">
+          <div>
+            <h2>Daemon settings</h2>
+            <p>The token comes from <code>PORTLESS_DEVICE_TOKEN</code>. Rotate it in the hosted dashboard, then update the container environment and restart this daemon.</p>
+          </div>
           <div class="row"><span>PMS</span><span>{pms_url}</span></div>
           <div class="row"><span>Control</span><span>{control_url}</span></div>
           <div class="row"><span>Data dir</span><span>{data_dir}</span></div>
           <div class="row"><span>Keepalive</span><span>{keepalive}</span></div>
+          <div class="note"><p>Open <code>/status.json</code> for a machine-readable view of this page.</p></div>
         </section>
       </div>
     </main>
+    <script>
+      document.querySelectorAll("[data-copy]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          const target = document.getElementById(button.dataset.copy);
+          if (!target) return;
+          await navigator.clipboard.writeText(target.textContent);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          setTimeout(() => {{ button.textContent = original; }}, 1400);
+        }});
+      }});
+    </script>
   </body>
 </html>"#,
-        status = escape(snapshot.status),
+        status_class = status_class,
+        status_copy = status_copy,
         public_url = escape(public_url),
         subdomain = escape(subdomain),
         generation = escape(&generation),
