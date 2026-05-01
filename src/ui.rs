@@ -32,12 +32,14 @@ struct UiSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum DaemonStatus {
     Starting,
-    Configured,
-    Connecting,
     Connected,
+    Reconnecting,
+    AuthFailed,
+    CapReached,
+    DeviceRevoked,
+    HomeUnreachable,
+    PlexUnreachable,
     RelayUnreachable,
-    RelayDisconnected,
-    PmsUnreachable,
 }
 
 impl UiState {
@@ -60,7 +62,6 @@ impl UiState {
 
     pub async fn set_device(&self, device: &DeviceConfig) {
         let mut snapshot = self.inner.write().await;
-        snapshot.status = DaemonStatus::Configured;
         snapshot.tunnel_id = Some(device.tunnel_id.clone());
         snapshot.subdomain = Some(device.subdomain.clone());
         snapshot.relay_address = Some(device.relay_address.clone());
@@ -320,12 +321,14 @@ fn escape(input: &str) -> String {
 fn status_label(status: DaemonStatus) -> &'static str {
     match status {
         DaemonStatus::Starting => "Starting",
-        DaemonStatus::Configured => "Configured",
-        DaemonStatus::Connecting => "Connecting",
         DaemonStatus::Connected => "Connected",
+        DaemonStatus::Reconnecting => "Reconnecting",
+        DaemonStatus::AuthFailed => "Auth failed",
+        DaemonStatus::CapReached => "Capacity reached",
+        DaemonStatus::DeviceRevoked => "Device revoked",
+        DaemonStatus::HomeUnreachable => "Home unreachable",
+        DaemonStatus::PlexUnreachable => "Plex unreachable",
         DaemonStatus::RelayUnreachable => "Relay unreachable",
-        DaemonStatus::RelayDisconnected => "Relay disconnected",
-        DaemonStatus::PmsUnreachable => "PMS unreachable",
     }
 }
 
@@ -333,9 +336,12 @@ fn status_class(status: DaemonStatus) -> &'static str {
     match status {
         DaemonStatus::Connected => "ok",
         DaemonStatus::RelayUnreachable
-        | DaemonStatus::RelayDisconnected
-        | DaemonStatus::PmsUnreachable => "bad",
-        DaemonStatus::Starting | DaemonStatus::Configured | DaemonStatus::Connecting => "wait",
+        | DaemonStatus::AuthFailed
+        | DaemonStatus::CapReached
+        | DaemonStatus::DeviceRevoked
+        | DaemonStatus::HomeUnreachable
+        | DaemonStatus::PlexUnreachable => "bad",
+        DaemonStatus::Starting | DaemonStatus::Reconnecting => "wait",
     }
 }
 
@@ -346,4 +352,29 @@ fn public_url(subdomain: &str, relay_address: &str) -> String {
         .trim_start_matches("http://")
         .trim_end_matches('/');
     format!("https://{subdomain}.{relay}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_status_json_matches_control_contract_names() {
+        let cases = [
+            (DaemonStatus::Starting, "starting"),
+            (DaemonStatus::Connected, "connected"),
+            (DaemonStatus::Reconnecting, "reconnecting"),
+            (DaemonStatus::AuthFailed, "auth_failed"),
+            (DaemonStatus::CapReached, "cap_reached"),
+            (DaemonStatus::DeviceRevoked, "device_revoked"),
+            (DaemonStatus::HomeUnreachable, "home_unreachable"),
+            (DaemonStatus::PlexUnreachable, "plex_unreachable"),
+            (DaemonStatus::RelayUnreachable, "relay_unreachable"),
+        ];
+
+        for (status, expected) in cases {
+            let encoded = serde_json::to_string(&status).expect("serialize daemon status");
+            assert_eq!(encoded, format!(r#""{expected}""#));
+        }
+    }
 }
