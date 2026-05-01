@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main, dev]
   push:
-    branches: [dev]
+    branches: [dev, main]
   workflow_dispatch:
 
 permissions:
@@ -122,7 +122,12 @@ jobs:
           {
             echo "IMAGE_TAGS<<EOF"
             echo "ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
-            echo "ghcr.io/${repo_lc}:dev"
+            if [ "${GITHUB_REF_NAME}" = "main" ]; then
+              echo "ghcr.io/${repo_lc}:latest"
+              echo "ghcr.io/${repo_lc}:prod"
+            else
+              echo "ghcr.io/${repo_lc}:dev"
+            fi
             echo "EOF"
           } >> "$GITHUB_ENV"
 
