@@ -16,7 +16,7 @@ pub struct UiState {
 
 #[derive(Clone, Serialize)]
 struct UiSnapshot {
-    status: &'static str,
+    status: DaemonStatus,
     pms_url: String,
     control_url: String,
     data_dir: String,
@@ -28,11 +28,23 @@ struct UiSnapshot {
     public_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStatus {
+    Starting,
+    Configured,
+    Connecting,
+    Connected,
+    RelayUnreachable,
+    RelayDisconnected,
+    PmsUnreachable,
+}
+
 impl UiState {
     pub fn new(cfg: &Config) -> Self {
         Self {
             inner: Arc::new(RwLock::new(UiSnapshot {
-                status: "starting",
+                status: DaemonStatus::Starting,
                 pms_url: cfg.pms_url.to_string(),
                 control_url: cfg.control_url.to_string(),
                 data_dir: cfg.data_dir.display().to_string(),
@@ -48,12 +60,16 @@ impl UiState {
 
     pub async fn set_device(&self, device: &DeviceConfig) {
         let mut snapshot = self.inner.write().await;
-        snapshot.status = "connected";
+        snapshot.status = DaemonStatus::Configured;
         snapshot.tunnel_id = Some(device.tunnel_id.clone());
         snapshot.subdomain = Some(device.subdomain.clone());
         snapshot.relay_address = Some(device.relay_address.clone());
         snapshot.config_generation = Some(device.config_generation);
         snapshot.public_url = Some(public_url(&device.subdomain, &device.relay_address));
+    }
+
+    pub async fn set_status(&self, status: DaemonStatus) {
+        self.inner.write().await.status = status;
     }
 
     async fn snapshot(&self) -> UiSnapshot {
@@ -160,9 +176,8 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .config_generation
         .map(|value| value.to_string())
         .unwrap_or_else(|| "Waiting".to_owned());
-    let connected = snapshot.status == "connected";
-    let status_class = if connected { "ok" } else { "wait" };
-    let status_copy = if connected { "Connected" } else { "Starting" };
+    let status_class = status_class(snapshot.status);
+    let status_copy = status_label(snapshot.status);
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -186,6 +201,8 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         --ok: #15803D;
         --ok-soft: #DCFCE7;
         --wait: #92400E;
+        --bad: #B91C1C;
+        --bad-soft: #FEE2E2;
         --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         color: var(--text);
@@ -205,6 +222,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
       .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-weight: 700; }}
       .status.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
       .status.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
+      .status.bad {{ border-color: #FCA5A5; background: var(--bad-soft); color: var(--bad); }}
       .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
       .layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; }}
       section {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
@@ -297,6 +315,28 @@ fn escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn status_label(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Starting => "Starting",
+        DaemonStatus::Configured => "Configured",
+        DaemonStatus::Connecting => "Connecting",
+        DaemonStatus::Connected => "Connected",
+        DaemonStatus::RelayUnreachable => "Relay unreachable",
+        DaemonStatus::RelayDisconnected => "Relay disconnected",
+        DaemonStatus::PmsUnreachable => "PMS unreachable",
+    }
+}
+
+fn status_class(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Connected => "ok",
+        DaemonStatus::RelayUnreachable
+        | DaemonStatus::RelayDisconnected
+        | DaemonStatus::PmsUnreachable => "bad",
+        DaemonStatus::Starting | DaemonStatus::Configured | DaemonStatus::Connecting => "wait",
+    }
 }
 
 fn public_url(subdomain: &str, relay_address: &str) -> String {

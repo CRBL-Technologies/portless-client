@@ -4,7 +4,7 @@ This daemon checklist mirrors the server transport checklist. The WebSocket tunn
 
 ## Acceptance Criteria
 
-- [x] Daemon generates and persists a local private key under `PORTLESS_DATA_DIR`.
+- [x] Daemon generates and persists an encrypted local private key under `PORTLESS_DATA_DIR`.
 - [x] Daemon submits a CSR with a stable request id to `/v1/device/certificates` using the device token.
 - [x] Daemon stores the issued certificate and CA trust bundle under `PORTLESS_DATA_DIR`.
 - [x] Daemon renews certificates before expiry with jitter.
@@ -17,6 +17,7 @@ This daemon checklist mirrors the server transport checklist. The WebSocket tunn
 - [x] Plex Range requests use the same parser-backed HTTP client path; no custom raw HTTP parser remains.
 - [x] Reconnect uses bounded exponential backoff with jitter and handles NAT rebinding.
 - [x] Request cancellation propagates across the QUIC stream.
+- [x] Daemon status UI distinguishes startup, relay unreachable, relay disconnected, connected, and PMS unreachable states.
 - [x] Integration coverage exercises normal HTTP, large streaming bodies, Range, Plex WebSocket notifications, SSE, cancellation, daemon reconnect, and certificate rejection.
 
 ## Cutover Guardrails
