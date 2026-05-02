@@ -611,6 +611,7 @@ fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
     reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_local_response(
     request_id: String,
     method: String,
