@@ -9,7 +9,7 @@ use config::Config;
 use control::ControlClient;
 use state::DaemonState;
 use tracing::info;
-use ui::UiState;
+use ui::{DaemonStatus, UiState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,10 +52,11 @@ async fn main() -> Result<()> {
     state.relay_address = Some(device.relay_address.clone());
     state.save(&cfg.data_dir).await?;
     ui_state.set_device(&device).await;
+    ui_state.set_status(DaemonStatus::Reconnecting).await;
     let identity = tunnel::ensure_identity(&cfg, &control, &device, &trust).await?;
 
     tokio::select! {
-        result = tunnel::run(cfg, device, identity) => result?,
+        result = tunnel::run(cfg, device, identity, ui_state.clone()) => result?,
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
         }
