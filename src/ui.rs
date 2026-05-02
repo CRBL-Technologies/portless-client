@@ -1,6 +1,5 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
-use portless_contracts::portless::v1::TunnelStatus;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -42,22 +41,6 @@ pub enum DaemonStatus {
     HomeUnreachable,
     PlexUnreachable,
     RelayUnreachable,
-}
-
-impl DaemonStatus {
-    pub fn contract_status(self) -> TunnelStatus {
-        match self {
-            DaemonStatus::Starting => TunnelStatus::Starting,
-            DaemonStatus::Connected => TunnelStatus::Connected,
-            DaemonStatus::Reconnecting => TunnelStatus::Reconnecting,
-            DaemonStatus::AuthFailed => TunnelStatus::AuthFailed,
-            DaemonStatus::CapReached => TunnelStatus::CapReached,
-            DaemonStatus::DeviceRevoked => TunnelStatus::DeviceRevoked,
-            DaemonStatus::HomeUnreachable => TunnelStatus::HomeUnreachable,
-            DaemonStatus::PlexUnreachable => TunnelStatus::PlexUnreachable,
-            DaemonStatus::RelayUnreachable => TunnelStatus::RelayUnreachable,
-        }
-    }
 }
 
 impl UiState {
@@ -374,7 +357,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_status_json_matches_control_contract_names() {
+    fn daemon_status_json_uses_expected_names() {
         let cases = [
             (DaemonStatus::Starting, "starting"),
             (DaemonStatus::Connected, "connected"),
@@ -390,7 +373,6 @@ mod tests {
         for (status, expected) in cases {
             let encoded = serde_json::to_string(&status).expect("serialize daemon status");
             assert_eq!(encoded, format!(r#""{expected}""#));
-            assert_ne!(status.contract_status(), TunnelStatus::Unspecified);
         }
     }
 
