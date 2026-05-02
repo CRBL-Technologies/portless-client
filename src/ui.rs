@@ -188,7 +188,6 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .public_url
         .as_deref()
         .unwrap_or("Waiting for device config");
-    let tunnel_id = snapshot.tunnel_id.as_deref().unwrap_or("Waiting");
     let subdomain = snapshot.subdomain.as_deref().unwrap_or("Waiting");
     let relay = snapshot.relay_address.as_deref().unwrap_or("Waiting");
     let generation = snapshot
@@ -283,7 +282,6 @@ fn render_html(snapshot: &UiSnapshot) -> String {
           <div class="meta">
             <div class="row"><span>Subdomain</span><span>{subdomain}</span></div>
             <div class="row"><span>Config generation</span><span>{generation}</span></div>
-            <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
             <div class="row"><span>Relay</span><span>{relay}</span></div>
             <div class="row"><span>Control status</span><span>{control_status}</span></div>
           </div>
@@ -320,7 +318,6 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         public_url = escape(public_url),
         subdomain = escape(subdomain),
         generation = escape(&generation),
-        tunnel_id = escape(tunnel_id),
         relay = escape(relay),
         control_status = escape(control_status),
         pms_url = escape(&snapshot.pms_url),
@@ -413,5 +410,26 @@ mod tests {
             assert_eq!(encoded, format!(r#""{expected}""#));
             assert_ne!(status.contract_status(), TunnelStatus::Unspecified);
         }
+    }
+
+    #[test]
+    fn dashboard_does_not_render_tunnel_id() {
+        let snapshot = UiSnapshot {
+            status: DaemonStatus::Connected,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://portless.io/".to_owned(),
+            data_dir: "/var/lib/portless".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: Some("tun_secret".to_owned()),
+            subdomain: Some("antoine".to_owned()),
+            relay_address: Some("portless.io:8443".to_owned()),
+            config_generation: Some(7),
+            public_url: Some("https://antoine.portless.io".to_owned()),
+        };
+
+        let html = render_html(&snapshot);
+
+        assert!(!html.contains("Tunnel ID"));
+        assert!(!html.contains("tun_secret"));
     }
 }
