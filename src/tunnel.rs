@@ -307,6 +307,7 @@ async fn forward_request(
             stream_local_response(
                 request.id,
                 request.method,
+                request.path_query,
                 response,
                 &mut send,
                 false,
@@ -360,6 +361,7 @@ async fn forward_upgrade_request(
             stream_local_response(
                 request.id,
                 request.method,
+                request.path_query,
                 response,
                 &mut send,
                 false,
@@ -612,6 +614,7 @@ fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
 async fn stream_local_response(
     request_id: String,
     method: String,
+    path_query: String,
     response: reqwest::Response,
     send: &mut SendStream,
     allow_upgrade_headers: bool,
@@ -619,7 +622,7 @@ async fn stream_local_response(
     rewrite: Option<&RedirectRewrite>,
 ) -> Result<()> {
     let status = response.status().as_u16();
-    let preserve_content_length = method.eq_ignore_ascii_case("HEAD");
+    let preserve_content_length = should_preserve_response_content_length(&method, &path_query);
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
@@ -1109,6 +1112,26 @@ fn serializable_response_headers(
             })
         })
         .collect()
+}
+
+fn should_preserve_response_content_length(method: &str, path_query: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+        || (method.eq_ignore_ascii_case("GET") && is_plex_download_media_path(path_query))
+}
+
+fn is_plex_download_media_path(path_query: &str) -> bool {
+    let path = path_query
+        .split_once('?')
+        .map_or(path_query, |(path, _)| path);
+    let segments: Vec<_> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        ["downloadQueue", _, "item", _, "media"]
+    )
 }
 
 fn is_hop_by_hop_response(name: &HeaderName, preserve_content_length: bool) -> bool {
@@ -1670,6 +1693,22 @@ mod tests {
             .iter()
             .any(|header| header.name == "content-length" && header.value == "1234"));
         assert!(!got.iter().any(|header| header.name == "transfer-encoding"));
+    }
+
+    #[test]
+    fn preserves_download_media_get_response_content_length() {
+        assert!(should_preserve_response_content_length(
+            "GET",
+            "/downloadQueue/2/item/75/media?token=redacted"
+        ));
+    }
+
+    #[test]
+    fn strips_generic_get_response_content_length() {
+        assert!(!should_preserve_response_content_length(
+            "GET",
+            "/library/parts/7490/file.mp4"
+        ));
     }
 
     #[test]
