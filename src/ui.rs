@@ -1,5 +1,6 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
+use portless_contracts::portless::v1::TunnelStatus;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -16,7 +17,7 @@ pub struct UiState {
 
 #[derive(Clone, Serialize)]
 struct UiSnapshot {
-    status: &'static str,
+    status: DaemonStatus,
     pms_url: String,
     control_url: String,
     data_dir: String,
@@ -28,11 +29,42 @@ struct UiSnapshot {
     public_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum DaemonStatus {
+    Starting,
+    Connected,
+    Reconnecting,
+    AuthFailed,
+    CapReached,
+    DeviceRevoked,
+    HomeUnreachable,
+    PlexUnreachable,
+    RelayUnreachable,
+}
+
+impl DaemonStatus {
+    pub fn contract_status(self) -> TunnelStatus {
+        match self {
+            DaemonStatus::Starting => TunnelStatus::Starting,
+            DaemonStatus::Connected => TunnelStatus::Connected,
+            DaemonStatus::Reconnecting => TunnelStatus::Reconnecting,
+            DaemonStatus::AuthFailed => TunnelStatus::AuthFailed,
+            DaemonStatus::CapReached => TunnelStatus::CapReached,
+            DaemonStatus::DeviceRevoked => TunnelStatus::DeviceRevoked,
+            DaemonStatus::HomeUnreachable => TunnelStatus::HomeUnreachable,
+            DaemonStatus::PlexUnreachable => TunnelStatus::PlexUnreachable,
+            DaemonStatus::RelayUnreachable => TunnelStatus::RelayUnreachable,
+        }
+    }
+}
+
 impl UiState {
     pub fn new(cfg: &Config) -> Self {
         Self {
             inner: Arc::new(RwLock::new(UiSnapshot {
-                status: "starting",
+                status: DaemonStatus::Starting,
                 pms_url: cfg.pms_url.to_string(),
                 control_url: cfg.control_url.to_string(),
                 data_dir: cfg.data_dir.display().to_string(),
@@ -48,12 +80,15 @@ impl UiState {
 
     pub async fn set_device(&self, device: &DeviceConfig) {
         let mut snapshot = self.inner.write().await;
-        snapshot.status = "connected";
         snapshot.tunnel_id = Some(device.tunnel_id.clone());
         snapshot.subdomain = Some(device.subdomain.clone());
         snapshot.relay_address = Some(device.relay_address.clone());
         snapshot.config_generation = Some(device.config_generation);
         snapshot.public_url = Some(public_url(&device.subdomain, &device.relay_address));
+    }
+
+    pub async fn set_status(&self, status: DaemonStatus) {
+        self.inner.write().await.status = status;
     }
 
     async fn snapshot(&self) -> UiSnapshot {
@@ -160,9 +195,9 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .config_generation
         .map(|value| value.to_string())
         .unwrap_or_else(|| "Waiting".to_owned());
-    let connected = snapshot.status == "connected";
-    let status_class = if connected { "ok" } else { "wait" };
-    let status_copy = if connected { "Connected" } else { "Starting" };
+    let status_class = status_class(snapshot.status);
+    let status_copy = status_label(snapshot.status);
+    let control_status = contract_status_label(snapshot.status.contract_status());
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -186,6 +221,8 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         --ok: #15803D;
         --ok-soft: #DCFCE7;
         --wait: #92400E;
+        --bad: #B91C1C;
+        --bad-soft: #FEE2E2;
         --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
         font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         color: var(--text);
@@ -205,6 +242,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
       .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-weight: 700; }}
       .status.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
       .status.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
+      .status.bad {{ border-color: #FCA5A5; background: var(--bad-soft); color: var(--bad); }}
       .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
       .layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; }}
       section {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
@@ -247,6 +285,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
             <div class="row"><span>Config generation</span><span>{generation}</span></div>
             <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
             <div class="row"><span>Relay</span><span>{relay}</span></div>
+            <div class="row"><span>Control status</span><span>{control_status}</span></div>
           </div>
         </section>
         <section class="panel" aria-label="Daemon settings">
@@ -283,6 +322,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         generation = escape(&generation),
         tunnel_id = escape(tunnel_id),
         relay = escape(relay),
+        control_status = escape(control_status),
         pms_url = escape(&snapshot.pms_url),
         control_url = escape(&snapshot.control_url),
         data_dir = escape(&snapshot.data_dir),
@@ -299,6 +339,48 @@ fn escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn status_label(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Starting => "Starting",
+        DaemonStatus::Connected => "Connected",
+        DaemonStatus::Reconnecting => "Reconnecting",
+        DaemonStatus::AuthFailed => "Auth failed",
+        DaemonStatus::CapReached => "Capacity reached",
+        DaemonStatus::DeviceRevoked => "Device revoked",
+        DaemonStatus::HomeUnreachable => "Home unreachable",
+        DaemonStatus::PlexUnreachable => "Plex unreachable",
+        DaemonStatus::RelayUnreachable => "Relay unreachable",
+    }
+}
+
+fn status_class(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Connected => "ok",
+        DaemonStatus::RelayUnreachable
+        | DaemonStatus::AuthFailed
+        | DaemonStatus::CapReached
+        | DaemonStatus::DeviceRevoked
+        | DaemonStatus::HomeUnreachable
+        | DaemonStatus::PlexUnreachable => "bad",
+        DaemonStatus::Starting | DaemonStatus::Reconnecting => "wait",
+    }
+}
+
+fn contract_status_label(status: TunnelStatus) -> &'static str {
+    match status {
+        TunnelStatus::Unspecified => "unspecified",
+        TunnelStatus::Starting => "starting",
+        TunnelStatus::Connected => "connected",
+        TunnelStatus::Reconnecting => "reconnecting",
+        TunnelStatus::AuthFailed => "auth_failed",
+        TunnelStatus::CapReached => "cap_reached",
+        TunnelStatus::DeviceRevoked => "device_revoked",
+        TunnelStatus::HomeUnreachable => "home_unreachable",
+        TunnelStatus::PlexUnreachable => "plex_unreachable",
+        TunnelStatus::RelayUnreachable => "relay_unreachable",
+    }
+}
+
 fn public_url(subdomain: &str, relay_address: &str) -> String {
     let relay = relay_address
         .trim()
@@ -306,4 +388,30 @@ fn public_url(subdomain: &str, relay_address: &str) -> String {
         .trim_start_matches("http://")
         .trim_end_matches('/');
     format!("https://{subdomain}.{relay}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_status_json_matches_control_contract_names() {
+        let cases = [
+            (DaemonStatus::Starting, "starting"),
+            (DaemonStatus::Connected, "connected"),
+            (DaemonStatus::Reconnecting, "reconnecting"),
+            (DaemonStatus::AuthFailed, "auth_failed"),
+            (DaemonStatus::CapReached, "cap_reached"),
+            (DaemonStatus::DeviceRevoked, "device_revoked"),
+            (DaemonStatus::HomeUnreachable, "home_unreachable"),
+            (DaemonStatus::PlexUnreachable, "plex_unreachable"),
+            (DaemonStatus::RelayUnreachable, "relay_unreachable"),
+        ];
+
+        for (status, expected) in cases {
+            let encoded = serde_json::to_string(&status).expect("serialize daemon status");
+            assert_eq!(encoded, format!(r#""{expected}""#));
+            assert_ne!(status.contract_status(), TunnelStatus::Unspecified);
+        }
+    }
 }
