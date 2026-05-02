@@ -9,6 +9,13 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#1f2933"/>
+  <path d="M18 19h21a9 9 0 0 1 0 18H28" fill="none" stroke="#f7f5ef" stroke-width="7" stroke-linecap="round"/>
+  <path d="M46 45H25a9 9 0 0 1 0-18h11" fill="none" stroke="#b7791f" stroke-width="7" stroke-linecap="round"/>
+</svg>
+"##;
+
 #[derive(Clone)]
 pub struct UiState {
     inner: Arc<RwLock<UiSnapshot>>,
@@ -110,10 +117,10 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
     let n = stream.read(&mut buf).await.context("read request")?;
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request_path(&request);
-    let snapshot = state.snapshot().await;
 
     match path {
         "/status.json" => {
+            let snapshot = state.snapshot().await;
             let body = serde_json::to_string_pretty(&snapshot).context("encode status json")?;
             write_response(
                 &mut stream,
@@ -126,7 +133,11 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
         "/healthz" => {
             write_response(&mut stream, "200 OK", "text/plain; charset=utf-8", "ok\n").await
         }
+        "/favicon.svg" | "/favicon.ico" => {
+            write_response(&mut stream, "200 OK", "image/svg+xml", FAVICON_SVG).await
+        }
         "/" => {
+            let snapshot = state.snapshot().await;
             let body = render_html(&snapshot);
             write_response(&mut stream, "200 OK", "text/html; charset=utf-8", &body).await
         }
@@ -143,11 +154,12 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
 }
 
 fn request_path(request: &str) -> &str {
-    request
+    let path = request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/")
+        .unwrap_or("/");
+    path.split_once('?').map_or(path, |(path, _)| path)
 }
 
 async fn write_response(
@@ -186,6 +198,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Portless client</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">
     <style>
       :root {{
         color-scheme: light;
@@ -398,5 +411,36 @@ mod tests {
         assert!(html.contains("Relay"));
         assert!(html.contains("portless.io:8443"));
         assert!(!html.contains("Control status"));
+    }
+
+    #[test]
+    fn dashboard_links_svg_favicon() {
+        let snapshot = UiSnapshot {
+            status: DaemonStatus::Connected,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://portless.io/".to_owned(),
+            data_dir: "/var/lib/portless".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: None,
+            subdomain: Some("antoine".to_owned()),
+            relay_address: Some("portless.io:8443".to_owned()),
+            config_generation: Some(7),
+            public_url: Some("https://antoine.portless.io".to_owned()),
+        };
+
+        let html = render_html(&snapshot);
+
+        assert!(html
+            .contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">"#));
+        assert!(FAVICON_SVG.contains(r##"fill="#1f2933""##));
+        assert!(FAVICON_SVG.contains(r##"stroke="#b7791f""##));
+    }
+
+    #[test]
+    fn request_path_ignores_query_string() {
+        assert_eq!(
+            request_path("GET /favicon.svg?v=20260428 HTTP/1.1\r\n\r\n"),
+            "/favicon.svg"
+        );
     }
 }
