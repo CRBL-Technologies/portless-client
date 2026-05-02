@@ -95,7 +95,7 @@ pub async fn ensure_identity(
         Err(err) => return Err(err).context("read daemon certificate"),
     };
     if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
-        if !certificate_needs_renewal(cert_pem, &device.tunnel_id) {
+        if !certificate_needs_renewal(cert_pem, device) {
             write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
             fs::write(&trust_path, &trust.pem)
                 .await
@@ -1364,7 +1364,7 @@ fn device_csr_pem(device: &DeviceConfig, key_pair: &KeyPair) -> Result<String> {
         .context("encode daemon CSR PEM")
 }
 
-fn certificate_needs_renewal(cert_pem: &str, tunnel_id: &str) -> bool {
+fn certificate_needs_renewal(cert_pem: &str, device: &DeviceConfig) -> bool {
     let Ok(certs) = parse_certs_pem(cert_pem) else {
         return true;
     };
@@ -1374,12 +1374,45 @@ fn certificate_needs_renewal(cert_pem: &str, tunnel_id: &str) -> bool {
     let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
         return true;
     };
+    if !certificate_matches_device(&cert, device) {
+        info!(
+            tunnel_id = %device.tunnel_id,
+            subdomain = %device.subdomain,
+            "cached daemon certificate identity does not match device config; requesting replacement"
+        );
+        return true;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let seconds_left = cert.validity().not_after.timestamp().saturating_sub(now);
-    seconds_left <= renewal_threshold_seconds(tunnel_id)
+    seconds_left <= renewal_threshold_seconds(&device.tunnel_id)
+}
+
+fn certificate_matches_device(cert: &X509Certificate<'_>, device: &DeviceConfig) -> bool {
+    let common_name_matches = cert.subject().iter_common_name().any(|name| {
+        name.as_str()
+            .map(|value| value == device.tunnel_id)
+            .unwrap_or(false)
+    });
+    if !common_name_matches {
+        return false;
+    }
+
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return false;
+    };
+    let expected_spiffe = format!("spiffe://portless.io/tunnel/{}", device.tunnel_id);
+    let dns_matches = san.value.general_names.iter().any(|name| match name {
+        GeneralName::DNSName(value) => *value == device.subdomain,
+        _ => false,
+    });
+    let spiffe_matches = san.value.general_names.iter().any(|name| match name {
+        GeneralName::URI(value) => *value == expected_spiffe,
+        _ => false,
+    });
+    dns_matches && spiffe_matches
 }
 
 fn renewal_threshold_seconds(tunnel_id: &str) -> i64 {
@@ -1620,6 +1653,30 @@ mod tests {
         assert!(threshold < 18 * 60 * 60);
     }
 
+    #[test]
+    fn cached_certificate_matching_device_is_reused() {
+        let device = test_device_config("tun_abc", "antoine");
+        let cert_pem = test_device_certificate("tun_abc", "antoine");
+
+        assert!(!certificate_needs_renewal(&cert_pem, &device));
+    }
+
+    #[test]
+    fn cached_certificate_for_previous_tunnel_is_renewed() {
+        let device = test_device_config("tun_new", "antoine");
+        let cert_pem = test_device_certificate("tun_old", "antoine");
+
+        assert!(certificate_needs_renewal(&cert_pem, &device));
+    }
+
+    #[test]
+    fn cached_certificate_for_previous_subdomain_is_renewed() {
+        let device = test_device_config("tun_abc", "antoine");
+        let cert_pem = test_device_certificate("tun_abc", "old-antoine");
+
+        assert!(certificate_needs_renewal(&cert_pem, &device));
+    }
+
     #[tokio::test]
     async fn encrypted_key_storage_migrates_plaintext_key() {
         let nonce = SystemTime::now()
@@ -1680,5 +1737,34 @@ mod tests {
         assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(12));
         assert_eq!(profile.quic_connect_timeout(), Duration::from_secs(4));
         assert_eq!(profile.relay_hello_timeout(), Duration::from_secs(5));
+    }
+
+    fn test_device_config(tunnel_id: &str, subdomain: &str) -> DeviceConfig {
+        DeviceConfig {
+            tunnel_id: tunnel_id.to_owned(),
+            subdomain: subdomain.to_owned(),
+            relay_address: "staging.portless.io:8443".to_owned(),
+            control_url: "https://staging.portless.io:8443".to_owned(),
+            config_generation: 1,
+            keepalive_profile: "residential".to_owned(),
+            monthly_bytes_used: 0,
+            monthly_byte_limit: 1_000_000_000_000,
+        }
+    }
+
+    fn test_device_certificate(tunnel_id: &str, subdomain: &str) -> String {
+        let mut params = CertificateParams::new(vec![subdomain.to_owned()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, tunnel_id.to_owned());
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            format!("spiffe://portless.io/tunnel/{tunnel_id}")
+                .try_into()
+                .unwrap(),
+        ));
+        let key_pair = KeyPair::generate().unwrap();
+        params.self_signed(&key_pair).unwrap().pem()
     }
 }
