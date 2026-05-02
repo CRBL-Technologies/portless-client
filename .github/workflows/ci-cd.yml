@@ -70,10 +70,10 @@ jobs:
           git diff --name-only "$base" "$head" > /tmp/changed-files
           while IFS= read -r file; do
             case "$file" in
-              .github/workflows/ci-cd.yml|.dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
+              .dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
-              docker-compose.portainer.yml)
+              .github/workflows/ci-cd.yml|docker-compose.portainer.yml)
                 deploy_config=true
                 ;;
             esac
@@ -233,6 +233,7 @@ jobs:
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image}]')"
           ENV_FILE="$(mktemp)"
           PAYLOAD_FILE="$(mktemp)"
+          UPDATE_RESPONSE_FILE="$(mktemp)"
           printf '%s' "$ENV_JSON" > "$ENV_FILE"
           jq -n --arg file "$STACK_FILE" --slurpfile env "$ENV_FILE" \
             '{stackFileContent: $file, env: $env[0], pullImage: true}' > "$PAYLOAD_FILE"
@@ -277,6 +278,7 @@ jobs:
           curl -sf --max-time 180 -X PUT \
             "${AUTH_HEADERS[@]}" \
             -H "Content-Type: application/json" \
+            -o "$UPDATE_RESPONSE_FILE" \
             -d @"$PAYLOAD_FILE" \
             "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
 
