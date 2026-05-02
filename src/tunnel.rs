@@ -619,10 +619,16 @@ async fn stream_local_response(
     rewrite: Option<&RedirectRewrite>,
 ) -> Result<()> {
     let status = response.status().as_u16();
+    let preserve_content_length = method.eq_ignore_ascii_case("HEAD");
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
-        headers: serializable_response_headers(response.headers(), allow_upgrade_headers, rewrite),
+        headers: serializable_response_headers(
+            response.headers(),
+            allow_upgrade_headers,
+            rewrite,
+            preserve_content_length,
+        ),
     };
     if let Err(err) = write_json_frame(send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
@@ -729,7 +735,7 @@ async fn stream_local_upgrade_response(
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
-        headers: serializable_response_headers(response.headers(), true, None),
+        headers: serializable_response_headers(response.headers(), true, None, false),
     };
     if let Err(err) = write_json_frame(&mut send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
@@ -1081,11 +1087,12 @@ fn serializable_response_headers(
     headers: &HeaderMap,
     allow_upgrade_headers: bool,
     rewrite: Option<&RedirectRewrite>,
+    preserve_content_length: bool,
 ) -> Vec<HeaderPair> {
     headers
         .iter()
         .filter_map(|(name, value)| {
-            if !allow_upgrade_headers && is_hop_by_hop_response(name) {
+            if !allow_upgrade_headers && is_hop_by_hop_response(name, preserve_content_length) {
                 return None;
             }
             let raw_value = value.to_str().ok()?;
@@ -1104,7 +1111,10 @@ fn serializable_response_headers(
         .collect()
 }
 
-fn is_hop_by_hop_response(name: &HeaderName) -> bool {
+fn is_hop_by_hop_response(name: &HeaderName, preserve_content_length: bool) -> bool {
+    if preserve_content_length && name == header::CONTENT_LENGTH {
+        return false;
+    }
     matches!(
         name.as_str(),
         "connection"
@@ -1620,7 +1630,7 @@ mod tests {
         headers.insert(header::UPGRADE, "websocket".parse().unwrap());
         headers.insert("sec-websocket-accept", "abc".parse().unwrap());
 
-        let got = serializable_response_headers(&headers, true, None);
+        let got = serializable_response_headers(&headers, true, None, false);
 
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|header| header.name == "connection"));
@@ -1637,11 +1647,28 @@ mod tests {
         headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
         headers.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
 
-        let got = serializable_response_headers(&headers, false, None);
+        let got = serializable_response_headers(&headers, false, None, false);
 
         assert_eq!(got.len(), 1);
         assert!(got.iter().any(|header| header.name == "content-type"));
         assert!(!got.iter().any(|header| header.name == "content-length"));
+        assert!(!got.iter().any(|header| header.name == "transfer-encoding"));
+    }
+
+    #[test]
+    fn preserves_head_response_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "1234".parse().unwrap());
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+
+        let got = serializable_response_headers(&headers, false, None, true);
+
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|header| header.name == "content-type"));
+        assert!(got
+            .iter()
+            .any(|header| header.name == "content-length" && header.value == "1234"));
         assert!(!got.iter().any(|header| header.name == "transfer-encoding"));
     }
 
