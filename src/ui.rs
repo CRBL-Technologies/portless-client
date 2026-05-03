@@ -1,6 +1,5 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
-use portless_contracts::portless::v1::TunnelStatus;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -9,6 +8,13 @@ use tokio::{
     sync::RwLock,
 };
 use tracing::{debug, info, warn};
+
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#1f2933"/>
+  <path d="M18 19h21a9 9 0 0 1 0 18H28" fill="none" stroke="#f7f5ef" stroke-width="7" stroke-linecap="round"/>
+  <path d="M46 45H25a9 9 0 0 1 0-18h11" fill="none" stroke="#b7791f" stroke-width="7" stroke-linecap="round"/>
+</svg>
+"##;
 
 #[derive(Clone)]
 pub struct UiState {
@@ -42,22 +48,6 @@ pub enum DaemonStatus {
     HomeUnreachable,
     PlexUnreachable,
     RelayUnreachable,
-}
-
-impl DaemonStatus {
-    pub fn contract_status(self) -> TunnelStatus {
-        match self {
-            DaemonStatus::Starting => TunnelStatus::Starting,
-            DaemonStatus::Connected => TunnelStatus::Connected,
-            DaemonStatus::Reconnecting => TunnelStatus::Reconnecting,
-            DaemonStatus::AuthFailed => TunnelStatus::AuthFailed,
-            DaemonStatus::CapReached => TunnelStatus::CapReached,
-            DaemonStatus::DeviceRevoked => TunnelStatus::DeviceRevoked,
-            DaemonStatus::HomeUnreachable => TunnelStatus::HomeUnreachable,
-            DaemonStatus::PlexUnreachable => TunnelStatus::PlexUnreachable,
-            DaemonStatus::RelayUnreachable => TunnelStatus::RelayUnreachable,
-        }
-    }
 }
 
 impl UiState {
@@ -127,10 +117,10 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
     let n = stream.read(&mut buf).await.context("read request")?;
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request_path(&request);
-    let snapshot = state.snapshot().await;
 
     match path {
         "/status.json" => {
+            let snapshot = state.snapshot().await;
             let body = serde_json::to_string_pretty(&snapshot).context("encode status json")?;
             write_response(
                 &mut stream,
@@ -143,7 +133,11 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
         "/healthz" => {
             write_response(&mut stream, "200 OK", "text/plain; charset=utf-8", "ok\n").await
         }
+        "/favicon.svg" | "/favicon.ico" => {
+            write_response(&mut stream, "200 OK", "image/svg+xml", FAVICON_SVG).await
+        }
         "/" => {
+            let snapshot = state.snapshot().await;
             let body = render_html(&snapshot);
             write_response(&mut stream, "200 OK", "text/html; charset=utf-8", &body).await
         }
@@ -160,11 +154,12 @@ async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
 }
 
 fn request_path(request: &str) -> &str {
-    request
+    let path = request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/")
+        .unwrap_or("/");
+    path.split_once('?').map_or(path, |(path, _)| path)
 }
 
 async fn write_response(
@@ -188,7 +183,6 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .public_url
         .as_deref()
         .unwrap_or("Waiting for device config");
-    let tunnel_id = snapshot.tunnel_id.as_deref().unwrap_or("Waiting");
     let subdomain = snapshot.subdomain.as_deref().unwrap_or("Waiting");
     let relay = snapshot.relay_address.as_deref().unwrap_or("Waiting");
     let generation = snapshot
@@ -197,7 +191,6 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .unwrap_or_else(|| "Waiting".to_owned());
     let status_class = status_class(snapshot.status);
     let status_copy = status_label(snapshot.status);
-    let control_status = contract_status_label(snapshot.status.contract_status());
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -205,6 +198,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Portless client</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">
     <style>
       :root {{
         color-scheme: light;
@@ -283,9 +277,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
           <div class="meta">
             <div class="row"><span>Subdomain</span><span>{subdomain}</span></div>
             <div class="row"><span>Config generation</span><span>{generation}</span></div>
-            <div class="row"><span>Tunnel ID</span><span>{tunnel_id}</span></div>
             <div class="row"><span>Relay</span><span>{relay}</span></div>
-            <div class="row"><span>Control status</span><span>{control_status}</span></div>
           </div>
         </section>
         <section class="panel" aria-label="Daemon settings">
@@ -320,9 +312,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         public_url = escape(public_url),
         subdomain = escape(subdomain),
         generation = escape(&generation),
-        tunnel_id = escape(tunnel_id),
         relay = escape(relay),
-        control_status = escape(control_status),
         pms_url = escape(&snapshot.pms_url),
         control_url = escape(&snapshot.control_url),
         data_dir = escape(&snapshot.data_dir),
@@ -366,21 +356,6 @@ fn status_class(status: DaemonStatus) -> &'static str {
     }
 }
 
-fn contract_status_label(status: TunnelStatus) -> &'static str {
-    match status {
-        TunnelStatus::Unspecified => "unspecified",
-        TunnelStatus::Starting => "starting",
-        TunnelStatus::Connected => "connected",
-        TunnelStatus::Reconnecting => "reconnecting",
-        TunnelStatus::AuthFailed => "auth_failed",
-        TunnelStatus::CapReached => "cap_reached",
-        TunnelStatus::DeviceRevoked => "device_revoked",
-        TunnelStatus::HomeUnreachable => "home_unreachable",
-        TunnelStatus::PlexUnreachable => "plex_unreachable",
-        TunnelStatus::RelayUnreachable => "relay_unreachable",
-    }
-}
-
 fn public_url(subdomain: &str, relay_address: &str) -> String {
     let relay = relay_address
         .trim()
@@ -395,7 +370,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_status_json_matches_control_contract_names() {
+    fn daemon_status_json_uses_expected_names() {
         let cases = [
             (DaemonStatus::Starting, "starting"),
             (DaemonStatus::Connected, "connected"),
@@ -411,7 +386,61 @@ mod tests {
         for (status, expected) in cases {
             let encoded = serde_json::to_string(&status).expect("serialize daemon status");
             assert_eq!(encoded, format!(r#""{expected}""#));
-            assert_ne!(status.contract_status(), TunnelStatus::Unspecified);
         }
+    }
+
+    #[test]
+    fn dashboard_keeps_relay_without_duplicate_control_status() {
+        let snapshot = UiSnapshot {
+            status: DaemonStatus::Connected,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://portless.io/".to_owned(),
+            data_dir: "/var/lib/portless".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: Some("tun_secret".to_owned()),
+            subdomain: Some("antoine".to_owned()),
+            relay_address: Some("portless.io:8443".to_owned()),
+            config_generation: Some(7),
+            public_url: Some("https://antoine.portless.io".to_owned()),
+        };
+
+        let html = render_html(&snapshot);
+
+        assert!(!html.contains("Tunnel ID"));
+        assert!(!html.contains("tun_secret"));
+        assert!(html.contains("Relay"));
+        assert!(html.contains("portless.io:8443"));
+        assert!(!html.contains("Control status"));
+    }
+
+    #[test]
+    fn dashboard_links_svg_favicon() {
+        let snapshot = UiSnapshot {
+            status: DaemonStatus::Connected,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://portless.io/".to_owned(),
+            data_dir: "/var/lib/portless".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: None,
+            subdomain: Some("antoine".to_owned()),
+            relay_address: Some("portless.io:8443".to_owned()),
+            config_generation: Some(7),
+            public_url: Some("https://antoine.portless.io".to_owned()),
+        };
+
+        let html = render_html(&snapshot);
+
+        assert!(html
+            .contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">"#));
+        assert!(FAVICON_SVG.contains(r##"fill="#1f2933""##));
+        assert!(FAVICON_SVG.contains(r##"stroke="#b7791f""##));
+    }
+
+    #[test]
+    fn request_path_ignores_query_string() {
+        assert_eq!(
+            request_path("GET /favicon.svg?v=20260428 HTTP/1.1\r\n\r\n"),
+            "/favicon.svg"
+        );
     }
 }
