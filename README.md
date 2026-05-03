@@ -19,8 +19,8 @@ forwards relay HTTP requests to the configured local Plex URL.
   daemon private key. If unset, the daemon creates `device.key.secret` under
   `PORTLESS_DATA_DIR` and stores only `device.key.pem.enc` for the key itself.
 
-The client status UI exposes the current tunnel identity and daemon settings on
-`/`, plus machine-readable status on `/status.json`. Status values distinguish
+The client status UI exposes the public tunnel URL and daemon settings on `/`,
+plus machine-readable status on `/status.json`. Status values distinguish
 startup, relay reachability, relay disconnects, and local PMS reachability. The
 UI never displays the device token.
 
