@@ -42,6 +42,7 @@ use x509_parser::prelude::*;
 use crate::{
     config::{Config, KeepaliveProfile},
     control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
+    state::DaemonState,
     ui::{DaemonStatus, UiState},
 };
 
@@ -76,7 +77,46 @@ pub struct TunnelIdentity {
     key_pem: String,
 }
 
-pub async fn ensure_identity(
+pub struct TunnelContext {
+    device: DeviceConfig,
+    identity: TunnelIdentity,
+}
+
+pub async fn load_tunnel_context(
+    cfg: &Config,
+    control: &ControlClient,
+    ui: &UiState,
+) -> Result<TunnelContext> {
+    let trust = control.fetch_trust().await?;
+    info!(trust_bytes = trust.pem.len(), "fetched trust bundle");
+
+    let device = control.fetch_device_config().await?;
+    info!(
+        tunnel_id = %device.tunnel_id,
+        subdomain = %device.subdomain,
+        relay = %device.relay_address,
+        config_generation = device.config_generation,
+        "fetched device config"
+    );
+    persist_device_state(cfg, &device, ui).await?;
+    ui.set_status(DaemonStatus::Reconnecting).await;
+
+    let identity = ensure_identity(cfg, control, &device, &trust).await?;
+    Ok(TunnelContext { device, identity })
+}
+
+async fn persist_device_state(cfg: &Config, device: &DeviceConfig, ui: &UiState) -> Result<()> {
+    let mut state = DaemonState::load(&cfg.data_dir).await?;
+    state.tunnel_id = Some(device.tunnel_id.clone());
+    state.subdomain = Some(device.subdomain.clone());
+    state.config_generation = Some(device.config_generation);
+    state.relay_address = Some(device.relay_address.clone());
+    state.save(&cfg.data_dir).await?;
+    ui.set_device(device).await;
+    Ok(())
+}
+
+async fn ensure_identity(
     cfg: &Config,
     control: &ControlClient,
     device: &DeviceConfig,
@@ -114,7 +154,7 @@ pub async fn ensure_identity(
     };
     let key_pem = key_pair.serialize_pem();
     let csr_pem = device_csr_pem(device, &key_pair)?;
-    let request_id = format!("{}-{}", device.tunnel_id, device.config_generation);
+    let request_id = certificate_request_id(device);
     let issued = control
         .request_certificate(&csr_pem, &request_id)
         .await
@@ -130,54 +170,98 @@ pub async fn ensure_identity(
 
 pub async fn run(
     cfg: Config,
-    device: DeviceConfig,
-    identity: TunnelIdentity,
+    control: ControlClient,
+    mut context: TunnelContext,
     ui: UiState,
 ) -> Result<()> {
-    let remote = relay_target(&device.relay_address).await?;
     let http = Client::builder()
         .redirect(Policy::none())
         .build()
         .context("build PMS HTTP client")?;
-    let client_config = quic_client_config(&identity, &cfg.keepalive_profile)?;
     let mut attempt = 0_u32;
 
     loop {
-        ui.set_status(DaemonStatus::Reconnecting).await;
-        let (endpoint, connection) =
-            match connect_once(&device, &client_config, &remote, &cfg.keepalive_profile).await {
-                Ok(active) => active,
+        if certificate_needs_renewal(&context.identity.cert_pem, &context.device) {
+            match load_tunnel_context(&cfg, &control, &ui).await {
+                Ok(updated) => {
+                    context = updated;
+                    attempt = 0;
+                }
                 Err(err) => {
                     ui.set_status(DaemonStatus::RelayUnreachable).await;
                     warn!(
                         error = %format!("{err:#}"),
-                        relay = %remote.addr,
                         attempt,
-                        "relay QUIC tunnel disconnected"
+                        "refresh daemon certificate failed"
                     );
                     let delay = reconnect_delay(attempt);
                     attempt = attempt.saturating_add(1);
                     time::sleep(delay).await;
                     continue;
                 }
-            };
+            }
+        }
+
+        let remote = relay_target(&context.device.relay_address).await?;
+        let client_config = quic_client_config(&context.identity, &cfg.keepalive_profile)?;
+        ui.set_status(DaemonStatus::Reconnecting).await;
+        let (endpoint, connection) = match connect_once(
+            &context.device,
+            &client_config,
+            &remote,
+            &cfg.keepalive_profile,
+        )
+        .await
+        {
+            Ok(active) => active,
+            Err(err) => {
+                ui.set_status(DaemonStatus::RelayUnreachable).await;
+                warn!(
+                    error = %format!("{err:#}"),
+                    relay = %remote.addr,
+                    attempt,
+                    "relay QUIC tunnel disconnected"
+                );
+                let delay = reconnect_delay(attempt);
+                attempt = attempt.saturating_add(1);
+                time::sleep(delay).await;
+                continue;
+            }
+        };
 
         attempt = 0;
         ui.set_status(DaemonStatus::Connected).await;
-        let delay = match serve_connection(&cfg, &http, endpoint, connection, ui.clone()).await {
-            Ok(status) => {
-                ui.set_status(status).await;
-                warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
-                if terminal_close_status(status) {
-                    Duration::from_secs(60)
-                } else {
-                    reconnect_delay(0)
+        let renewal_delay = certificate_renewal_delay(&context.identity.cert_pem, &context.device);
+        let renewal_timer = time::sleep(renewal_delay);
+        tokio::pin!(renewal_timer);
+        let connection_for_renewal = connection.clone();
+        let delay = tokio::select! {
+            result = serve_connection(&cfg, &http, endpoint, connection, ui.clone()) => {
+                match result {
+                    Ok(status) => {
+                        ui.set_status(status).await;
+                        warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
+                        if terminal_close_status(status) {
+                            Duration::from_secs(60)
+                        } else {
+                            reconnect_delay(0)
+                        }
+                    }
+                    Err(err) => {
+                        ui.set_status(DaemonStatus::Reconnecting).await;
+                        warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
+                        reconnect_delay(0)
+                    }
                 }
             }
-            Err(err) => {
+            _ = &mut renewal_timer => {
                 ui.set_status(DaemonStatus::Reconnecting).await;
-                warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
-                reconnect_delay(0)
+                connection_for_renewal.close(STREAM_CANCELLED, b"daemon certificate renewal");
+                info!(
+                    relay = %remote.addr,
+                    "daemon certificate renewal threshold reached; reconnecting"
+                );
+                Duration::ZERO
             }
         };
         time::sleep(delay).await;
@@ -1416,12 +1500,57 @@ fn certificate_needs_renewal(cert_pem: &str, device: &DeviceConfig) -> bool {
         );
         return true;
     }
-    let now = SystemTime::now()
+    seconds_until_certificate_renewal(&cert, device) <= 0
+}
+
+fn certificate_renewal_delay(cert_pem: &str, device: &DeviceConfig) -> Duration {
+    let Ok(certs) = parse_certs_pem(cert_pem) else {
+        return Duration::ZERO;
+    };
+    let Some(leaf) = certs.first() else {
+        return Duration::ZERO;
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Duration::ZERO;
+    };
+    if !certificate_matches_device(&cert, device) {
+        return Duration::ZERO;
+    }
+    let seconds = seconds_until_certificate_renewal(&cert, device);
+    if seconds <= 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(seconds as u64)
+    }
+}
+
+fn seconds_until_certificate_renewal(cert: &X509Certificate<'_>, device: &DeviceConfig) -> i64 {
+    let seconds_left = cert
+        .validity()
+        .not_after
+        .timestamp()
+        .saturating_sub(now_unix_seconds());
+    seconds_left - renewal_threshold_seconds(&device.tunnel_id)
+}
+
+fn certificate_request_id(device: &DeviceConfig) -> String {
+    certificate_request_id_at(device, now_unix_seconds())
+}
+
+fn certificate_request_id_at(device: &DeviceConfig, unix_seconds: i64) -> String {
+    format!(
+        "{}-{}-h{}",
+        device.tunnel_id,
+        device.config_generation,
+        unix_seconds.div_euclid(60 * 60)
+    )
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
-    let seconds_left = cert.validity().not_after.timestamp().saturating_sub(now);
-    seconds_left <= renewal_threshold_seconds(&device.tunnel_id)
+        .as_secs() as i64
 }
 
 fn certificate_matches_device(cert: &X509Certificate<'_>, device: &DeviceConfig) -> bool {
@@ -1721,11 +1850,21 @@ mod tests {
     }
 
     #[test]
+    fn certificate_request_id_rotates_by_hour() {
+        let device = test_device_config("tun_abc", "antoine");
+
+        assert_eq!(certificate_request_id_at(&device, 3_600), "tun_abc-1-h1");
+        assert_eq!(certificate_request_id_at(&device, 7_199), "tun_abc-1-h1");
+        assert_eq!(certificate_request_id_at(&device, 7_200), "tun_abc-1-h2");
+    }
+
+    #[test]
     fn cached_certificate_matching_device_is_reused() {
         let device = test_device_config("tun_abc", "antoine");
         let cert_pem = test_device_certificate("tun_abc", "antoine");
 
         assert!(!certificate_needs_renewal(&cert_pem, &device));
+        assert!(certificate_renewal_delay(&cert_pem, &device) > Duration::ZERO);
     }
 
     #[test]
