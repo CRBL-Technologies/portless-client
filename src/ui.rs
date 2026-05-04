@@ -16,6 +16,14 @@ const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 </svg>
 "##;
 
+const BRAND_LOCKUP_HTML: &str = r##"<span class="brand-lockup" aria-hidden="true">
+  <svg class="brand-mark" viewBox="0 0 64 64" focusable="false">
+    <path d="M18 19h21a9 9 0 0 1 0 18H28" fill="none" stroke="#1f2933" stroke-width="7" stroke-linecap="round"/>
+    <path d="M46 45H25a9 9 0 0 1 0-18h11" fill="none" stroke="#b7791f" stroke-width="7" stroke-linecap="round"/>
+  </svg>
+  <span class="brand-word">Portless client</span>
+</span>"##;
+
 #[derive(Clone)]
 pub struct UiState {
     inner: Arc<RwLock<UiSnapshot>>,
@@ -191,6 +199,8 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         .unwrap_or_else(|| "Waiting".to_owned());
     let status_class = status_class(snapshot.status);
     let status_copy = status_label(snapshot.status);
+    let status_help = status_help(snapshot.status);
+    let dashboard_url = dashboard_url(&snapshot.control_url);
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -210,6 +220,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         --border: #E7D8C4;
         --border-strong: #D6BFA1;
         --accent: #D97706;
+        --accent-link: #B45309;
         --accent-hover: #B45309;
         --accent-soft: #FEF3C7;
         --ok: #15803D;
@@ -226,17 +237,27 @@ fn render_html(snapshot: &UiSnapshot) -> String {
       body {{ min-width: 320px; margin: 0; background: var(--canvas); }}
       main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 48px; }}
       header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }}
-      h1 {{ margin: 0; font-family: var(--mono); font-size: 28px; line-height: 1.15; letter-spacing: 0; }}
-      h1 span {{ color: var(--accent); }}
+      a {{ color: var(--accent-link); }}
+      a:hover {{ color: var(--accent-hover); }}
+      a:focus-visible, button:focus-visible {{ outline: 3px solid var(--accent-soft); outline-offset: 3px; }}
+      .brand {{ color: var(--text); text-decoration: none; }}
+      .brand-lockup {{ display: inline-flex; align-items: center; gap: 10px; }}
+      .brand-mark {{ width: 34px; height: 34px; flex: 0 0 auto; }}
+      .brand-word {{ font-family: var(--mono); font-size: 26px; line-height: 1.15; font-weight: 800; letter-spacing: 0; }}
+      .header-actions {{ display: inline-flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
+      .dashboard-link {{ display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-strong); color: var(--text); font-weight: 800; text-decoration: none; }}
+      .dashboard-link:hover {{ border-color: var(--accent); background: var(--accent-soft); color: var(--text); }}
       h2 {{ margin: 0; font-size: 24px; line-height: 1.18; letter-spacing: 0; }}
       h3 {{ margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: 0; }}
       p {{ margin: 0; color: var(--muted); line-height: 1.55; }}
       button {{ display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-strong); color: var(--text); font: inherit; font-weight: 800; cursor: pointer; }}
       button:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+      .status-block {{ display: grid; justify-items: end; gap: 6px; max-width: 360px; }}
       .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-weight: 700; }}
       .status.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
       .status.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
       .status.bad {{ border-color: #FCA5A5; background: var(--bad-soft); color: var(--bad); }}
+      .status-help {{ max-width: none; text-align: right; font-size: 13px; line-height: 1.4; }}
       .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
       .layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; }}
       section {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
@@ -252,7 +273,9 @@ fn render_html(snapshot: &UiSnapshot) -> String {
       @media (max-width: 780px) {{
         main {{ width: min(100vw - 20px, 1120px); padding-top: 16px; }}
         header {{ align-items: flex-start; flex-direction: column; }}
-        h1 {{ font-size: 24px; }}
+        .brand-word {{ font-size: 23px; }}
+        .header-actions, .status-block {{ justify-content: flex-start; justify-items: start; }}
+        .status-help {{ text-align: left; }}
         .layout {{ grid-template-columns: 1fr; }}
         .row {{ grid-template-columns: 1fr; gap: 4px; }}
       }}
@@ -261,8 +284,14 @@ fn render_html(snapshot: &UiSnapshot) -> String {
   <body>
     <main>
       <header>
-        <h1><span>P</span>ortless client</h1>
-        <div class="status {status_class}"><span class="dot" aria-hidden="true"></span>{status_copy}</div>
+        <a class="brand" href="/" aria-label="Portless client home">{brand}</a>
+        <div class="header-actions">
+          <a class="dashboard-link" href="{dashboard_url}" rel="noopener">Open hosted dashboard</a>
+          <div class="status-block">
+            <div class="status {status_class}"><span class="dot" aria-hidden="true"></span>{status_copy}</div>
+            <p class="status-help">{status_help}</p>
+          </div>
+        </div>
       </header>
       <div class="layout">
         <section class="panel">
@@ -285,10 +314,10 @@ fn render_html(snapshot: &UiSnapshot) -> String {
             <h2>Daemon settings</h2>
             <p>The token comes from <code>PORTLESS_DEVICE_TOKEN</code>. Rotate it in the hosted dashboard, then update the container environment and restart this daemon.</p>
           </div>
-          <div class="row"><span>PMS</span><span>{pms_url}</span></div>
-          <div class="row"><span>Control</span><span>{control_url}</span></div>
-          <div class="row"><span>Data dir</span><span>{data_dir}</span></div>
-          <div class="row"><span>Keepalive</span><span>{keepalive}</span></div>
+          <div class="row"><span>Plex server</span><span>{pms_url}</span></div>
+          <div class="row"><span>Portless control URL</span><span>{control_url}</span></div>
+          <div class="row"><span>Data directory</span><span>{data_dir}</span></div>
+          <div class="row"><span>Keepalive profile</span><span>{keepalive}</span></div>
           <div class="note"><p>Open <code>/status.json</code> for a machine-readable view of this page.</p></div>
         </section>
       </div>
@@ -309,6 +338,9 @@ fn render_html(snapshot: &UiSnapshot) -> String {
 </html>"#,
         status_class = status_class,
         status_copy = status_copy,
+        status_help = escape(status_help),
+        brand = BRAND_LOCKUP_HTML,
+        dashboard_url = escape(&dashboard_url),
         public_url = escape(public_url),
         subdomain = escape(subdomain),
         generation = escape(&generation),
@@ -343,6 +375,32 @@ fn status_label(status: DaemonStatus) -> &'static str {
     }
 }
 
+fn status_help(status: DaemonStatus) -> &'static str {
+    match status {
+        DaemonStatus::Starting => "Starting the tunnel and loading device configuration.",
+        DaemonStatus::Connected => "The daemon is connected to the Portless relay.",
+        DaemonStatus::Reconnecting => "Reconnecting to the relay. If this persists, check the container logs and network path.",
+        DaemonStatus::AuthFailed => {
+            "Auth failed. Rotate the daemon token in the hosted dashboard, update PORTLESS_DEVICE_TOKEN, and restart the container."
+        }
+        DaemonStatus::CapReached => {
+            "Capacity reached. Wait for quota reset or manage billing in the hosted dashboard."
+        }
+        DaemonStatus::DeviceRevoked => {
+            "Device revoked. Rotate the daemon token in the hosted dashboard and restart this daemon with the new token."
+        }
+        DaemonStatus::HomeUnreachable => {
+            "Home network unreachable. Check that this container can reach your LAN and DNS."
+        }
+        DaemonStatus::PlexUnreachable => {
+            "Plex unreachable. Check that PORTLESS_PMS_URL resolves from this container."
+        }
+        DaemonStatus::RelayUnreachable => {
+            "Relay unreachable. Check outbound firewall rules and the Portless control URL."
+        }
+    }
+}
+
 fn status_class(status: DaemonStatus) -> &'static str {
     match status {
         DaemonStatus::Connected => "ok",
@@ -354,6 +412,17 @@ fn status_class(status: DaemonStatus) -> &'static str {
         | DaemonStatus::PlexUnreachable => "bad",
         DaemonStatus::Starting | DaemonStatus::Reconnecting => "wait",
     }
+}
+
+fn dashboard_url(control_url: &str) -> String {
+    let base = control_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return "https://join.portless.io/dashboard".to_owned();
+    }
+    if base.ends_with("/dashboard") {
+        return base.to_owned();
+    }
+    format!("{base}/dashboard")
 }
 
 fn public_url(subdomain: &str, relay_address: &str) -> String {
@@ -410,7 +479,22 @@ mod tests {
         assert!(!html.contains("tun_secret"));
         assert!(html.contains("Relay"));
         assert!(html.contains("portless.io:8443"));
+        assert!(html.contains("Open hosted dashboard"));
+        assert!(html.contains("Plex server"));
+        assert!(html.contains("Portless control URL"));
         assert!(!html.contains("Control status"));
+    }
+
+    #[test]
+    fn dashboard_url_is_derived_from_control_url() {
+        assert_eq!(
+            dashboard_url("https://join.portless.io/"),
+            "https://join.portless.io/dashboard"
+        );
+        assert_eq!(
+            dashboard_url("https://join.portless.io/dashboard"),
+            "https://join.portless.io/dashboard"
+        );
     }
 
     #[test]
