@@ -21,7 +21,8 @@ const BRAND_LOCKUP_HTML: &str = r##"<span class="brand-lockup" aria-hidden="true
     <path d="M18 19h21a9 9 0 0 1 0 18H28" fill="none" stroke="#1f2933" stroke-width="7" stroke-linecap="round"/>
     <path d="M46 45H25a9 9 0 0 1 0-18h11" fill="none" stroke="#b7791f" stroke-width="7" stroke-linecap="round"/>
   </svg>
-  <span class="brand-word">Portless client</span>
+  <span class="brand-word">Portless</span>
+  <span class="brand-scope">local daemon</span>
 </span>"##;
 
 #[derive(Clone)]
@@ -35,6 +36,7 @@ struct UiSnapshot {
     pms_url: String,
     control_url: String,
     data_dir: String,
+    ui_addr: String,
     keepalive_profile: String,
     tunnel_id: Option<String>,
     subdomain: Option<String>,
@@ -66,6 +68,10 @@ impl UiState {
                 pms_url: cfg.pms_url.to_string(),
                 control_url: cfg.control_url.to_string(),
                 data_dir: cfg.data_dir.display().to_string(),
+                ui_addr: cfg
+                    .ui_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "disabled".to_owned()),
                 keepalive_profile: format!("{:?}", cfg.keepalive_profile).to_ascii_lowercase(),
                 tunnel_id: None,
                 subdomain: None,
@@ -207,7 +213,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Portless client</title>
+    <title>Portless daemon · local UI</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">
     <style>
       :root {{
@@ -217,8 +223,8 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         --surface-strong: #FFFFFF;
         --text: #1C1917;
         --muted: #78716C;
-        --border: #E7D8C4;
-        --border-strong: #D6BFA1;
+        --border: #E7E5E4;
+        --border-strong: #D6D3D1;
         --accent: #D97706;
         --accent-link: #B45309;
         --accent-hover: #B45309;
@@ -235,90 +241,122 @@ fn render_html(snapshot: &UiSnapshot) -> String {
       }}
       * {{ box-sizing: border-box; }}
       body {{ min-width: 320px; margin: 0; background: var(--canvas); }}
-      main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 48px; }}
-      header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }}
       a {{ color: var(--accent-link); }}
       a:hover {{ color: var(--accent-hover); }}
       a:focus-visible, button:focus-visible {{ outline: 3px solid var(--accent-soft); outline-offset: 3px; }}
+      .localhost-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 16px; background: #1C1917; color: #A8A29E; font-family: var(--mono); font-size: 12px; }}
+      .localhost-bar .left {{ display: inline-flex; align-items: center; gap: 8px; min-width: 0; }}
+      .localhost-bar .dot {{ width: 7px; height: 7px; border-radius: 999px; background: var(--ok); box-shadow: 0 0 6px rgb(21 128 61 / 60%); }}
+      .localhost-bar .url {{ color: #FBBF24; overflow-wrap: anywhere; }}
+      .topbar {{ position: sticky; top: 0; z-index: 10; border-bottom: 1px solid var(--border); background: rgb(255 251 245 / 92%); backdrop-filter: blur(12px); }}
+      .topbar-inner {{ width: min(1100px, calc(100vw - 32px)); margin: 0 auto; padding: 14px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; }}
       .brand {{ color: var(--text); text-decoration: none; }}
-      .brand-lockup {{ display: inline-flex; align-items: center; gap: 10px; }}
-      .brand-mark {{ width: 34px; height: 34px; flex: 0 0 auto; }}
-      .brand-word {{ font-family: var(--mono); font-size: 26px; line-height: 1.15; font-weight: 800; letter-spacing: 0; }}
-      .header-actions {{ display: inline-flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-      .dashboard-link {{ display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-strong); color: var(--text); font-weight: 800; text-decoration: none; }}
-      .dashboard-link:hover {{ border-color: var(--accent); background: var(--accent-soft); color: var(--text); }}
-      h2 {{ margin: 0; font-size: 24px; line-height: 1.18; letter-spacing: 0; }}
+      .brand-lockup {{ display: inline-flex; align-items: center; gap: 8px; }}
+      .brand-mark {{ width: 24px; height: 24px; flex: 0 0 auto; }}
+      .brand-word {{ font-family: var(--mono); font-size: 17px; line-height: 1.15; font-weight: 800; letter-spacing: 0; }}
+      .brand-scope {{ margin-left: 6px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-family: var(--mono); font-size: 12px; }}
+      .page {{ width: min(1100px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 56px; display: grid; gap: 20px; }}
+      h1 {{ margin: 0 0 6px; font-size: 26px; line-height: 1.15; font-weight: 600; letter-spacing: 0; }}
+      h2 {{ margin: 0; font-size: 15px; line-height: 1.25; letter-spacing: 0; }}
       h3 {{ margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: 0; }}
       p {{ margin: 0; color: var(--muted); line-height: 1.55; }}
-      button {{ display: inline-flex; align-items: center; justify-content: center; min-height: 38px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-strong); color: var(--text); font: inherit; font-weight: 800; cursor: pointer; }}
+      button, .dashboard-link {{ display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-strong); color: var(--text); font: inherit; font-weight: 600; cursor: pointer; text-decoration: none; }}
       button:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
-      .status-block {{ display: grid; justify-items: end; gap: 6px; max-width: 360px; }}
-      .status {{ display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-weight: 700; }}
-      .status.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
-      .status.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
-      .status.bad {{ border-color: #FCA5A5; background: var(--bad-soft); color: var(--bad); }}
-      .status-help {{ max-width: none; text-align: right; font-size: 13px; line-height: 1.4; }}
-      .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
-      .layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 16px; }}
-      section {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
-      .panel {{ display: grid; gap: 16px; align-content: start; padding: 22px; }}
-      .url-wrap {{ display: grid; gap: 10px; }}
-      .url {{ display: block; width: 100%; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-strong); color: var(--text); font-family: var(--mono); font-size: 15px; }}
-      .meta {{ display: grid; gap: 0; }}
-      .row {{ display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 10px; padding: 12px 0; border-top: 1px solid var(--border); }}
-      .row:first-child {{ border-top: 0; }}
-      .row span:first-child {{ color: var(--muted); font-weight: 800; }}
+      .dashboard-link:hover {{ border-color: var(--accent); background: var(--accent-soft); color: var(--text); }}
+      .status-hero {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: center; padding: 24px 28px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
+      .pill-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
+      .status-pill {{ display: inline-flex; align-items: center; gap: 7px; min-height: 28px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-strong); color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 600; }}
+      .status-pill .dot {{ width: 7px; height: 7px; border-radius: 999px; background: currentColor; }}
+      .status-pill.ok {{ border-color: #86EFAC; background: var(--ok-soft); color: var(--ok); }}
+      .status-pill.wait {{ border-color: #FCD34D; background: var(--accent-soft); color: var(--wait); }}
+      .status-pill.bad {{ border-color: #FCA5A5; background: var(--bad-soft); color: var(--bad); }}
+      .url-line {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-family: var(--mono); font-size: 14px; }}
+      .url-line code {{ color: var(--accent-link); overflow-wrap: anywhere; }}
+      .hero-actions {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+      .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
+      .stat, .card {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }}
+      .stat {{ display: grid; gap: 5px; padding: 16px; }}
+      .stat-label {{ display: flex; align-items: center; gap: 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: lowercase; }}
+      .stat-value {{ color: var(--text); font-size: 22px; line-height: 1.1; font-weight: 600; overflow-wrap: anywhere; }}
+      .stat-meta {{ color: var(--muted); font-family: var(--mono); font-size: 12px; }}
+      .cols {{ display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); gap: 20px; }}
+      .card {{ display: grid; gap: 16px; align-content: start; padding: 22px 24px; }}
+      .card-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+      .card-head .meta {{ color: var(--muted); font-family: var(--mono); font-size: 12px; }}
+      .rows {{ display: grid; gap: 0; }}
+      .row {{ display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 14px; padding: 11px 0; border-top: 1px solid var(--border); }}
+      .row:first-child {{ border-top: 0; padding-top: 4px; }}
+      .row span:first-child {{ color: var(--muted); font-family: var(--mono); font-size: 11px; font-weight: 600; }}
       .row span:last-child {{ overflow-wrap: anywhere; }}
       .note {{ border: 1px solid var(--border); border-radius: 8px; background: var(--surface-strong); padding: 12px; }}
-      @media (max-width: 780px) {{
-        main {{ width: min(100vw - 20px, 1120px); padding-top: 16px; }}
-        header {{ align-items: flex-start; flex-direction: column; }}
-        .brand-word {{ font-size: 23px; }}
-        .header-actions, .status-block {{ justify-content: flex-start; justify-items: start; }}
-        .status-help {{ text-align: left; }}
-        .layout {{ grid-template-columns: 1fr; }}
+      @media (max-width: 860px) {{
+        .status-hero, .cols {{ grid-template-columns: 1fr; }}
+        .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      }}
+      @media (max-width: 620px) {{
+        .localhost-bar {{ align-items: flex-start; flex-direction: column; gap: 4px; }}
+        .topbar-inner, .page {{ width: min(100vw - 20px, 1100px); }}
+        .topbar-inner {{ align-items: flex-start; flex-direction: column; }}
+        .status-hero {{ padding: 20px; }}
+        .hero-actions, .stats {{ grid-template-columns: 1fr; }}
         .row {{ grid-template-columns: 1fr; gap: 4px; }}
       }}
     </style>
   </head>
   <body>
-    <main>
-      <header>
-        <a class="brand" href="/" aria-label="Portless client home">{brand}</a>
-        <div class="header-actions">
-          <a class="dashboard-link" href="{dashboard_url}" rel="noopener">Open hosted dashboard</a>
-          <div class="status-block">
-            <div class="status {status_class}"><span class="dot" aria-hidden="true"></span>{status_copy}</div>
-            <p class="status-help">{status_help}</p>
+    <div class="localhost-bar">
+      <div class="left"><span class="dot" aria-hidden="true"></span><span>local daemon UI</span><span class="url">{ui_addr}</span></div>
+      <span>no inbound internet port required</span>
+    </div>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="Portless local daemon">{brand}</a>
+        <a class="dashboard-link" href="{dashboard_url}" rel="noopener">Open hosted dashboard</a>
+      </div>
+    </header>
+    <main class="page">
+      <section class="status-hero">
+        <div>
+          <div class="pill-row">
+            <span class="status-pill {status_class}"><span class="dot" aria-hidden="true"></span>{status_copy}</span>
+          </div>
+          <h1>{status_copy}</h1>
+          <p>{status_help}</p>
+          <div class="url-line">
+            <span>public URL</span>
+            <code id="public-url">{public_url}</code>
           </div>
         </div>
-      </header>
-      <div class="layout">
-        <section class="panel">
-          <div>
-            <h2>Public tunnel</h2>
-            <p>This is the customer URL served through Portless when the daemon is connected.</p>
-          </div>
-          <div class="url-wrap">
-            <code id="public-url" class="url">{public_url}</code>
-            <button type="button" data-copy="public-url">Copy public URL</button>
-          </div>
-          <div class="meta">
-            <div class="row"><span>Subdomain</span><span>{subdomain}</span></div>
-            <div class="row"><span>Config generation</span><span>{generation}</span></div>
-            <div class="row"><span>Relay</span><span>{relay}</span></div>
+        <div class="hero-actions">
+          <button type="button" data-copy="public-url">Copy public URL</button>
+          <a class="dashboard-link" href="/status.json">Open status JSON</a>
+        </div>
+      </section>
+      <section class="stats" aria-label="Daemon summary">
+        <div class="stat"><span class="stat-label">status</span><strong class="stat-value">{status_copy}</strong><span class="stat-meta">local process</span></div>
+        <div class="stat"><span class="stat-label">subdomain</span><strong class="stat-value">{subdomain}</strong><span class="stat-meta">Portless hostname</span></div>
+        <div class="stat"><span class="stat-label">Relay</span><strong class="stat-value">{relay}</strong><span class="stat-meta">QUIC outbound</span></div>
+        <div class="stat"><span class="stat-label">config</span><strong class="stat-value">{generation}</strong><span class="stat-meta">generation</span></div>
+      </section>
+      <div class="cols">
+        <section class="card">
+          <div class="card-head"><h2>Connection path</h2><span class="meta">QUIC tunnel</span></div>
+          <div class="rows">
+            <div class="row"><span>Browser URL</span><span>{public_url}</span></div>
+            <div class="row"><span>Portless relay</span><span>{relay}</span></div>
+            <div class="row"><span>Plex server</span><span>{pms_url}</span></div>
+            <div class="row"><span>Local UI</span><span>{ui_addr}</span></div>
           </div>
         </section>
-        <section class="panel" aria-label="Daemon settings">
-          <div>
-            <h2>Daemon settings</h2>
-            <p>The token comes from <code>PORTLESS_DEVICE_TOKEN</code>. Rotate it in the hosted dashboard, then update the container environment and restart this daemon.</p>
+        <section class="card" aria-label="Daemon settings">
+          <div class="card-head"><h2>Daemon settings</h2><span class="meta">container env</span></div>
+          <p>The token comes from <code>PORTLESS_DEVICE_TOKEN</code>. Rotate it in the hosted dashboard, then update the container environment and restart this daemon.</p>
+          <div class="rows">
+            <div class="row"><span>Portless control URL</span><span>{control_url}</span></div>
+            <div class="row"><span>Data directory</span><span>{data_dir}</span></div>
+            <div class="row"><span>Keepalive</span><span>{keepalive}</span></div>
           </div>
-          <div class="row"><span>Plex server</span><span>{pms_url}</span></div>
-          <div class="row"><span>Portless control URL</span><span>{control_url}</span></div>
-          <div class="row"><span>Data directory</span><span>{data_dir}</span></div>
-          <div class="row"><span>Keepalive profile</span><span>{keepalive}</span></div>
-          <div class="note"><p>Open <code>/status.json</code> for a machine-readable view of this page.</p></div>
+          <div class="note"><p><code>/status.json</code> exposes the same state for health checks and local automation.</p></div>
         </section>
       </div>
     </main>
@@ -327,7 +365,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         button.addEventListener("click", async () => {{
           const target = document.getElementById(button.dataset.copy);
           if (!target) return;
-          await navigator.clipboard.writeText(target.textContent);
+          await navigator.clipboard.writeText(target.textContent || "");
           const original = button.textContent;
           button.textContent = "Copied";
           setTimeout(() => {{ button.textContent = original; }}, 1400);
@@ -341,6 +379,7 @@ fn render_html(snapshot: &UiSnapshot) -> String {
         status_help = escape(status_help),
         brand = BRAND_LOCKUP_HTML,
         dashboard_url = escape(&dashboard_url),
+        ui_addr = escape(&snapshot.ui_addr),
         public_url = escape(public_url),
         subdomain = escape(subdomain),
         generation = escape(&generation),
@@ -465,6 +504,7 @@ mod tests {
             pms_url: "http://plex:32400/".to_owned(),
             control_url: "https://portless.io/".to_owned(),
             data_dir: "/var/lib/portless".to_owned(),
+            ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: Some("tun_secret".to_owned()),
             subdomain: Some("antoine".to_owned()),
@@ -504,6 +544,7 @@ mod tests {
             pms_url: "http://plex:32400/".to_owned(),
             control_url: "https://portless.io/".to_owned(),
             data_dir: "/var/lib/portless".to_owned(),
+            ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: None,
             subdomain: Some("antoine".to_owned()),
