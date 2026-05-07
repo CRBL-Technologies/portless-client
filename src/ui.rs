@@ -458,6 +458,27 @@ fn dashboard_url(control_url: &str) -> String {
     if base.is_empty() {
         return "https://join.portless.io/dashboard".to_owned();
     }
+    if let Ok(parsed) = url::Url::parse(base) {
+        if let Some(host) = parsed.host_str() {
+            let dashboard_target = match host {
+                "connect.portless.io" => Some(("join.portless.io".to_owned(), None)),
+                "connect.staging.portless.io" => {
+                    Some(("staging-join.portless.io".to_owned(), None))
+                }
+                _ => host
+                    .strip_prefix("connect.")
+                    .map(|suffix| (format!("join.{suffix}"), parsed.port())),
+            };
+            if let Some((dashboard_host, dashboard_port)) = dashboard_target {
+                let mut dashboard = format!("{}://{}", parsed.scheme(), dashboard_host);
+                if let Some(port) = dashboard_port {
+                    dashboard.push_str(&format!(":{port}"));
+                }
+                dashboard.push_str("/dashboard");
+                return dashboard;
+            }
+        }
+    }
     if base.ends_with("/dashboard") {
         return base.to_owned();
     }
@@ -470,7 +491,21 @@ fn public_url(subdomain: &str, relay_address: &str) -> String {
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    format!("https://{subdomain}.{relay}")
+    let mut host = relay;
+    let mut port = "";
+    if let Some((candidate_host, candidate_port)) = relay.rsplit_once(':') {
+        host = candidate_host;
+        port = candidate_port;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() > 2 && labels[0].to_ascii_lowercase().starts_with("relay-") {
+        host = &host[labels[0].len() + 1..];
+    }
+    if port.is_empty() || port == "443" {
+        format!("https://{subdomain}.{host}")
+    } else {
+        format!("https://{subdomain}.{host}:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -528,12 +563,36 @@ mod tests {
     #[test]
     fn dashboard_url_is_derived_from_control_url() {
         assert_eq!(
+            dashboard_url("https://connect.portless.io/"),
+            "https://join.portless.io/dashboard"
+        );
+        assert_eq!(
+            dashboard_url("https://connect.staging.portless.io:8443/"),
+            "https://staging-join.portless.io/dashboard"
+        );
+        assert_eq!(
+            dashboard_url("https://connect.portless.localhost:8443/"),
+            "https://join.portless.localhost:8443/dashboard"
+        );
+        assert_eq!(
             dashboard_url("https://join.portless.io/"),
             "https://join.portless.io/dashboard"
         );
         assert_eq!(
             dashboard_url("https://join.portless.io/dashboard"),
             "https://join.portless.io/dashboard"
+        );
+    }
+
+    #[test]
+    fn public_url_uses_customer_domain_for_relay_hosts() {
+        assert_eq!(
+            public_url("antoine", "relay-ams-1.portless.io:443"),
+            "https://antoine.portless.io"
+        );
+        assert_eq!(
+            public_url("antoine", "relay-ams-1.staging.portless.io:8443"),
+            "https://antoine.staging.portless.io:8443"
         );
     }
 
