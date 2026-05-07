@@ -64,7 +64,7 @@ impl Config {
         }
 
         let pms_url = parse_url("PORTLESS_PMS_URL", "http://plex:32400")?;
-        let control_url = parse_url("PORTLESS_CONTROL_URL", "https://portless.io")?;
+        let control_url = parse_url("PORTLESS_CONTROL_URL", "https://connect.portless.io")?;
         let data_dir = PathBuf::from(
             env::var("PORTLESS_DATA_DIR").unwrap_or_else(|_| "/var/lib/portless".to_owned()),
         );
