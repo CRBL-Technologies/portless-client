@@ -7,9 +7,8 @@ mod ui;
 use anyhow::Result;
 use config::Config;
 use control::ControlClient;
-use state::DaemonState;
 use tracing::info;
-use ui::{DaemonStatus, UiState};
+use ui::UiState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,30 +32,10 @@ async fn main() -> Result<()> {
         "starting portless daemon"
     );
 
-    let trust = control.fetch_trust().await?;
-    info!(trust_bytes = trust.pem.len(), "fetched trust bundle");
-
-    let device = control.fetch_device_config().await?;
-    info!(
-        tunnel_id = %device.tunnel_id,
-        subdomain = %device.subdomain,
-        relay = %device.relay_address,
-        config_generation = device.config_generation,
-        "fetched device config"
-    );
-
-    let mut state = DaemonState::load(&cfg.data_dir).await?;
-    state.tunnel_id = Some(device.tunnel_id.clone());
-    state.subdomain = Some(device.subdomain.clone());
-    state.config_generation = Some(device.config_generation);
-    state.relay_address = Some(device.relay_address.clone());
-    state.save(&cfg.data_dir).await?;
-    ui_state.set_device(&device).await;
-    ui_state.set_status(DaemonStatus::Reconnecting).await;
-    let identity = tunnel::ensure_identity(&cfg, &control, &device, &trust).await?;
+    let context = tunnel::load_tunnel_context(&cfg, &control, &ui_state).await?;
 
     tokio::select! {
-        result = tunnel::run(cfg, device, identity, ui_state.clone()) => result?,
+        result = tunnel::run(cfg, control, context, ui_state.clone()) => result?,
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
         }
