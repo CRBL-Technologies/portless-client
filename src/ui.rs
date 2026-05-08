@@ -462,7 +462,7 @@ fn dashboard_url(control_url: &str) -> String {
         if let Some(host) = parsed.host_str() {
             let dashboard_target = match host {
                 "connect.portless.io" => Some(("join.portless.io".to_owned(), None)),
-                "connect.staging.portless.io" => {
+                "staging-connect.portless.io" => {
                     Some(("staging-join.portless.io".to_owned(), None))
                 }
                 _ => host
@@ -567,7 +567,7 @@ mod tests {
             "https://join.portless.io/dashboard"
         );
         assert_eq!(
-            dashboard_url("https://connect.staging.portless.io:8443/"),
+            dashboard_url("https://staging-connect.portless.io:8443/"),
             "https://staging-join.portless.io/dashboard"
         );
         assert_eq!(
