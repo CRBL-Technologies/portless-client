@@ -465,9 +465,6 @@ fn dashboard_url(control_url: &str) -> String {
                 "staging-connect.portless.io" => {
                     Some(("staging-join.portless.io".to_owned(), None))
                 }
-                "connect.staging.portless.io" => {
-                    Some(("staging-join.portless.io".to_owned(), None))
-                }
                 _ => host
                     .strip_prefix("connect.")
                     .map(|suffix| (format!("join.{suffix}"), parsed.port())),
@@ -571,10 +568,6 @@ mod tests {
         );
         assert_eq!(
             dashboard_url("https://staging-connect.portless.io:8443/"),
-            "https://staging-join.portless.io/dashboard"
-        );
-        assert_eq!(
-            dashboard_url("https://connect.staging.portless.io:8443/"),
             "https://staging-join.portless.io/dashboard"
         );
         assert_eq!(
