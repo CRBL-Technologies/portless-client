@@ -229,8 +229,9 @@ jobs:
 
           ENV_JSON="$(echo "$ENV_JSON" | jq -c \
             --arg image "$CLIENT_IMAGE" \
-            'map(select(.name != "PORTLESS_CLIENT_IMAGE")) +
-             [{"name":"PORTLESS_CLIENT_IMAGE","value":$image}]')"
+            'map(select(.name | IN("PORTLESS_CLIENT_IMAGE","PORTLESS_CONTROL_URL") | not)) +
+             [{"name":"PORTLESS_CLIENT_IMAGE","value":$image},
+              {"name":"PORTLESS_CONTROL_URL","value":"https://staging-connect.portless.io:8443"}]')"
           ENV_FILE="$(mktemp)"
           PAYLOAD_FILE="$(mktemp)"
           UPDATE_RESPONSE_FILE="$(mktemp)"
