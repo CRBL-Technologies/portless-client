@@ -48,7 +48,5 @@ cargo clippy --locked -- -D warnings
 cargo deny check advisories bans licenses sources
 ```
 
-`cargo deny` intentionally leaves duplicate-version warnings visible. Review
-[SECURITY.md](SECURITY.md) and
-[docs/public-readiness.md](docs/public-readiness.md) before changing repository
-visibility.
+`cargo deny` intentionally leaves duplicate-version warnings visible. Security
+reporting and sensitive-data guidance are in [SECURITY.md](SECURITY.md).
