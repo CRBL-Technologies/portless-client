@@ -88,6 +88,8 @@ pub struct DeviceConfig {
     pub tunnel_id: String,
     pub subdomain: String,
     pub relay_address: String,
+    #[serde(default)]
+    pub public_url: Option<String>,
     pub control_url: String,
     pub config_generation: i64,
     pub keepalive_profile: String,

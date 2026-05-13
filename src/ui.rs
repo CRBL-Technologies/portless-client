@@ -88,7 +88,10 @@ impl UiState {
         snapshot.subdomain = Some(device.subdomain.clone());
         snapshot.relay_address = Some(device.relay_address.clone());
         snapshot.config_generation = Some(device.config_generation);
-        snapshot.public_url = Some(public_url(&device.subdomain, &device.relay_address));
+        snapshot.public_url = device
+            .public_url
+            .clone()
+            .or_else(|| Some(public_url(&device.subdomain, &device.relay_address)));
     }
 
     pub async fn set_status(&self, status: DaemonStatus) {
@@ -542,10 +545,10 @@ mod tests {
             ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: Some("tun_secret".to_owned()),
-            subdomain: Some("antoine".to_owned()),
+            subdomain: Some("sample".to_owned()),
             relay_address: Some("portless.io:8443".to_owned()),
             config_generation: Some(7),
-            public_url: Some("https://antoine.portless.io".to_owned()),
+            public_url: Some("https://sample.portless.io".to_owned()),
         };
 
         let html = render_html(&snapshot);
@@ -571,6 +574,10 @@ mod tests {
             "https://staging-join.portless.io/dashboard"
         );
         assert_eq!(
+            dashboard_url("https://connect.port-less.com/"),
+            "https://join.port-less.com/dashboard"
+        );
+        assert_eq!(
             dashboard_url("https://connect.portless.localhost:8443/"),
             "https://join.portless.localhost:8443/dashboard"
         );
@@ -587,12 +594,12 @@ mod tests {
     #[test]
     fn public_url_uses_customer_domain_for_relay_hosts() {
         assert_eq!(
-            public_url("antoine", "relay-ams-1.portless.io:443"),
-            "https://antoine.portless.io"
+            public_url("sample", "relay-ams-1.portless.io:443"),
+            "https://sample.portless.io"
         );
         assert_eq!(
-            public_url("antoine", "relay-ams-1.staging.portless.io:8443"),
-            "https://antoine.staging.portless.io:8443"
+            public_url("sample", "relay-ams-1.staging.portless.io:8443"),
+            "https://sample.staging.portless.io:8443"
         );
     }
 
@@ -606,10 +613,10 @@ mod tests {
             ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: None,
-            subdomain: Some("antoine".to_owned()),
+            subdomain: Some("sample".to_owned()),
             relay_address: Some("portless.io:8443".to_owned()),
             config_generation: Some(7),
-            public_url: Some("https://antoine.portless.io".to_owned()),
+            public_url: Some("https://sample.portless.io".to_owned()),
         };
 
         let html = render_html(&snapshot);

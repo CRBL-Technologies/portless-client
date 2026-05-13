@@ -39,3 +39,5 @@ Rust tooling is required to run local checks:
 cargo fmt
 cargo test
 ```
+
+Before changing repository visibility, review [SECURITY.md](SECURITY.md) and [docs/public-readiness.md](docs/public-readiness.md).
