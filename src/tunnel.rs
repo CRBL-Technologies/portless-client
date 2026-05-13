@@ -16,9 +16,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
+use getrandom::fill as fill_random;
 use portless_contracts::portless::v1::QuicApplicationErrorCode;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
-use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -1379,8 +1379,8 @@ async fn write_encrypted_device_key(data_dir: &Path, key_pem: &str) -> Result<()
     let secret = read_or_create_device_key_secret(data_dir).await?;
     let mut salt = [0_u8; 16];
     let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce);
+    fill_random(&mut salt)?;
+    fill_random(&mut nonce)?;
     let key = derive_device_key(&secret, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| anyhow!("build daemon key cipher: invalid key length"))?;
@@ -1460,7 +1460,7 @@ async fn read_or_create_device_key_secret(data_dir: &Path) -> Result<Vec<u8>> {
         Ok(secret) => Ok(secret),
         Err(err) if is_not_found(&err) => {
             let mut secret = [0_u8; 32];
-            OsRng.fill_bytes(&mut secret);
+            fill_random(&mut secret)?;
             let path = data_dir.join(DEVICE_KEY_SECRET_FILE);
             write_secret_file(&path, &secret).await?;
             Ok(secret.to_vec())
