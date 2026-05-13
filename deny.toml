@@ -15,15 +15,15 @@ allow = [
   "Elastic-2.0",
   "ISC",
   "MIT",
-  "MPL-2.0",
-  "OpenSSL",
   "Unicode-3.0",
   "Zlib",
 ]
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+# Duplicate versions are currently expected in the tonic/quinn dependency graph.
+# Advisories still fail vulnerable duplicate crates.
+multiple-versions = "allow"
 wildcards = "allow"
 highlight = "all"
 
