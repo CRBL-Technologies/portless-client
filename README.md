@@ -3,44 +3,51 @@
 [![Client CI/CD](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml?query=branch%3Adev)
 [![Security](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml?query=branch%3Adev)
 
-Rust daemon for the customer-side Portless tunnel.
+Customer-side Portless daemon.
 
-The MVP install path is Docker Compose only. The daemon reads a reveal-once
-device token, fetches trust and tunnel config from the control plane, stores
-local state under a data directory, opens a QUIC/mTLS tunnel to the relay, and
-forwards relay HTTP requests to the configured local Plex URL.
+The daemon uses a reveal-once device token to register with the control plane,
+opens a QUIC/mTLS tunnel to the relay, and forwards public tunnel traffic to the
+configured local Plex URL.
 
-## Environment
+## Requirements
 
-- `PORTLESS_DEVICE_TOKEN` - reveal-once daemon token from the admin/control surface.
-- `PORTLESS_PMS_URL` - Plex Media Server URL, default `http://plex:32400`.
-- `PORTLESS_CONTROL_URL` - daemon bootstrap/control URL, default `https://connect.portless.io`. Do not point this at the Access-protected join/admin hosts.
+- Rust `1.95.0`
+- Docker Compose for the example stack
+
+## Configuration
+
+- `PORTLESS_DEVICE_TOKEN` - reveal-once daemon token from the join/admin flow.
+- `PORTLESS_CONTROL_URL` - daemon bootstrap URL, normally
+  `https://connect.portless.io` in production.
+- `PORTLESS_PMS_URL` - local Plex URL, for example `http://192.168.1.42:32400`.
 - `PORTLESS_DATA_DIR` - daemon state directory, default `/var/lib/portless`.
+- `PORTLESS_UI_ADDR` - status UI bind address, default `127.0.0.1:43180`; set
+  to `off` to disable.
 - `PORTLESS_KEEPALIVE_PROFILE` - `residential`, `cellular`, or `conservative`.
-- `PORTLESS_UI_ADDR` - local status UI bind address, default `127.0.0.1:43180`; set to `off` to disable.
 - `PORTLESS_DEVICE_KEY_SECRET` - optional external secret for encrypting the
-  daemon private key. If unset, the daemon creates `device.key.secret` under
-  `PORTLESS_DATA_DIR` and stores only `device.key.pem.enc` for the key itself.
+  local daemon private key.
 
-The client status UI exposes the public tunnel URL and daemon settings on `/`,
-plus machine-readable status on `/status.json`. Status values distinguish
-startup, relay reachability, relay disconnects, and local PMS reachability. The
-UI never displays the device token.
+The status UI is available at `/`; machine-readable state is available at
+`/status.json`.
 
-## Local Compose
+## Run With Compose
 
 ```sh
 cp .env.example .env
 docker compose -f docker-compose.example.yml up --build
 ```
 
-Open `http://127.0.0.1:43180/` to inspect the local daemon status page.
+Open `http://127.0.0.1:43180/` for local daemon status.
 
-Rust tooling is required to run local checks:
+## Check
 
 ```sh
-cargo fmt
-cargo test
+cargo fmt -- --check
+cargo test --locked
+cargo clippy --locked -- -D warnings
+cargo deny check advisories bans licenses sources
 ```
 
-Before changing repository visibility, review [SECURITY.md](SECURITY.md) and [docs/public-readiness.md](docs/public-readiness.md).
+`cargo deny` intentionally leaves duplicate-version warnings visible. Review
+[SECURITY.md](SECURITY.md) and [docs/public-readiness.md](docs/public-readiness.md)
+before changing repository visibility.
