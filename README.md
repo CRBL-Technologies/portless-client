@@ -1,5 +1,8 @@
 # Portless Client
 
+[![Client CI/CD](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml?query=branch%3Adev)
+[![Security](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml?query=branch%3Adev)
+
 Rust daemon for the customer-side Portless tunnel.
 
 The MVP install path is Docker Compose only. The daemon reads a reveal-once
