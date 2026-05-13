@@ -231,7 +231,7 @@ jobs:
             --arg image "$CLIENT_IMAGE" \
             'map(select(.name | IN("PORTLESS_CLIENT_IMAGE","PORTLESS_CONTROL_URL") | not)) +
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image},
-              {"name":"PORTLESS_CONTROL_URL","value":"https://staging-connect.portless.io:8443"}]')"
+              {"name":"PORTLESS_CONTROL_URL","value":"https://connect.port-less.com"}]')"
           ENV_FILE="$(mktemp)"
           PAYLOAD_FILE="$(mktemp)"
           UPDATE_RESPONSE_FILE="$(mktemp)"
