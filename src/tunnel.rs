@@ -1950,6 +1950,7 @@ mod tests {
             tunnel_id: tunnel_id.to_owned(),
             subdomain: subdomain.to_owned(),
             relay_address: "staging.portless.io:8443".to_owned(),
+            public_url: None,
             control_url: "https://staging.portless.io:8443".to_owned(),
             config_generation: 1,
             keepalive_profile: "residential".to_owned(),
