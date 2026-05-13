@@ -545,10 +545,10 @@ mod tests {
             ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: Some("tun_secret".to_owned()),
-            subdomain: Some("antoine".to_owned()),
+            subdomain: Some("sample".to_owned()),
             relay_address: Some("portless.io:8443".to_owned()),
             config_generation: Some(7),
-            public_url: Some("https://antoine.portless.io".to_owned()),
+            public_url: Some("https://sample.portless.io".to_owned()),
         };
 
         let html = render_html(&snapshot);
@@ -594,12 +594,12 @@ mod tests {
     #[test]
     fn public_url_uses_customer_domain_for_relay_hosts() {
         assert_eq!(
-            public_url("antoine", "relay-ams-1.portless.io:443"),
-            "https://antoine.portless.io"
+            public_url("sample", "relay-ams-1.portless.io:443"),
+            "https://sample.portless.io"
         );
         assert_eq!(
-            public_url("antoine", "relay-ams-1.staging.portless.io:8443"),
-            "https://antoine.staging.portless.io:8443"
+            public_url("sample", "relay-ams-1.staging.portless.io:8443"),
+            "https://sample.staging.portless.io:8443"
         );
     }
 
@@ -613,10 +613,10 @@ mod tests {
             ui_addr: "127.0.0.1:43180".to_owned(),
             keepalive_profile: "residential".to_owned(),
             tunnel_id: None,
-            subdomain: Some("antoine".to_owned()),
+            subdomain: Some("sample".to_owned()),
             relay_address: Some("portless.io:8443".to_owned()),
             config_generation: Some(7),
-            public_url: Some("https://antoine.portless.io".to_owned()),
+            public_url: Some("https://sample.portless.io".to_owned()),
         };
 
         let html = render_html(&snapshot);

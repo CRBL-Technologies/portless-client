@@ -1734,7 +1734,7 @@ mod tests {
             &[
                 HeaderPair {
                     name: "host".to_owned(),
-                    value: "antoine.staging.portless.io".to_owned(),
+                    value: "sample.staging.portless.io".to_owned(),
                 },
                 HeaderPair {
                     name: "x-forwarded-proto".to_owned(),
@@ -1748,7 +1748,7 @@ mod tests {
             .location("http://127.0.0.1:32400/web/index.html")
             .unwrap();
 
-        assert_eq!(got, "https://antoine.staging.portless.io/web/index.html");
+        assert_eq!(got, "https://sample.staging.portless.io/web/index.html");
     }
 
     #[test]
@@ -1759,7 +1759,7 @@ mod tests {
             &[
                 HeaderPair {
                     name: "host".to_owned(),
-                    value: "antoine.staging.portless.io".to_owned(),
+                    value: "sample.staging.portless.io".to_owned(),
                 },
                 HeaderPair {
                     name: "x-forwarded-proto".to_owned(),
@@ -1770,10 +1770,10 @@ mod tests {
         .unwrap();
 
         let got = rewrite
-            .location("http://antoine.staging.portless.io/web/index.html")
+            .location("http://sample.staging.portless.io/web/index.html")
             .unwrap();
 
-        assert_eq!(got, "https://antoine.staging.portless.io/web/index.html");
+        assert_eq!(got, "https://sample.staging.portless.io/web/index.html");
     }
 
     #[test]
@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn certificate_request_id_rotates_by_hour() {
-        let device = test_device_config("tun_abc", "antoine");
+        let device = test_device_config("tun_abc", "sample");
 
         assert_eq!(certificate_request_id_at(&device, 3_600), "tun_abc-1-h1");
         assert_eq!(certificate_request_id_at(&device, 7_199), "tun_abc-1-h1");
@@ -1860,8 +1860,8 @@ mod tests {
 
     #[test]
     fn cached_certificate_matching_device_is_reused() {
-        let device = test_device_config("tun_abc", "antoine");
-        let cert_pem = test_device_certificate("tun_abc", "antoine");
+        let device = test_device_config("tun_abc", "sample");
+        let cert_pem = test_device_certificate("tun_abc", "sample");
 
         assert!(!certificate_needs_renewal(&cert_pem, &device));
         assert!(certificate_renewal_delay(&cert_pem, &device) > Duration::ZERO);
@@ -1869,16 +1869,16 @@ mod tests {
 
     #[test]
     fn cached_certificate_for_previous_tunnel_is_renewed() {
-        let device = test_device_config("tun_new", "antoine");
-        let cert_pem = test_device_certificate("tun_old", "antoine");
+        let device = test_device_config("tun_new", "sample");
+        let cert_pem = test_device_certificate("tun_old", "sample");
 
         assert!(certificate_needs_renewal(&cert_pem, &device));
     }
 
     #[test]
     fn cached_certificate_for_previous_subdomain_is_renewed() {
-        let device = test_device_config("tun_abc", "antoine");
-        let cert_pem = test_device_certificate("tun_abc", "old-antoine");
+        let device = test_device_config("tun_abc", "sample");
+        let cert_pem = test_device_certificate("tun_abc", "old-sample");
 
         assert!(certificate_needs_renewal(&cert_pem, &device));
     }
