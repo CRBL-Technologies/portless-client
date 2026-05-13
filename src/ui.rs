@@ -88,7 +88,10 @@ impl UiState {
         snapshot.subdomain = Some(device.subdomain.clone());
         snapshot.relay_address = Some(device.relay_address.clone());
         snapshot.config_generation = Some(device.config_generation);
-        snapshot.public_url = Some(public_url(&device.subdomain, &device.relay_address));
+        snapshot.public_url = device
+            .public_url
+            .clone()
+            .or_else(|| Some(public_url(&device.subdomain, &device.relay_address)));
     }
 
     pub async fn set_status(&self, status: DaemonStatus) {
@@ -569,6 +572,10 @@ mod tests {
         assert_eq!(
             dashboard_url("https://staging-connect.portless.io:8443/"),
             "https://staging-join.portless.io/dashboard"
+        );
+        assert_eq!(
+            dashboard_url("https://connect.port-less.com/"),
+            "https://join.port-less.com/dashboard"
         );
         assert_eq!(
             dashboard_url("https://connect.portless.localhost:8443/"),
