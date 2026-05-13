@@ -21,9 +21,7 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Duplicate versions are currently expected in the tonic/quinn dependency graph.
-# Advisories still fail vulnerable duplicate crates.
-multiple-versions = "allow"
+multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 
