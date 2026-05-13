@@ -3,6 +3,7 @@ name = "portless-daemon"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.76"
+license = "Elastic-2.0"
 
 [dependencies]
 anyhow = "1"
@@ -10,7 +11,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
 futures-util = "0.3"
-portless-contracts = { git = "https://github.com/CRBL-Technologies/portless-contracts", branch = "dev" }
+portless-contracts = { git = "https://github.com/CRBL-Technologies/portless-contracts", tag = "v1.0.2" }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,7 +22,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 quinn = "0.11"
 rustls = "0.23"
-rustls-pemfile = "2"
 rcgen = "0.13"
 x509-parser = "0.16"
 tokio-stream = "0.1"
