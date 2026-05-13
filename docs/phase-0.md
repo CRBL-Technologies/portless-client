@@ -1,6 +1,6 @@
-# Phase 0 Daemon Baseline
+# Daemon Implementation Notes
 
-Implemented now:
+The current daemon baseline includes:
 
 - Environment-driven daemon configuration.
 - Control-plane calls for trust bundle and device config.
@@ -12,4 +12,5 @@ Implemented now:
 - Proxy one relay stream to one Plex HTTP request.
 - Docker Compose install path with a fake Plex target.
 
-See `docs/quic-cutover-todo.md` for the transport cutover acceptance criteria.
+See `docs/quic-cutover-todo.md` for the implemented transport acceptance
+criteria.
