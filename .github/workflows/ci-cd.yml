@@ -111,6 +111,7 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.daemon == 'true'
     permissions:
       contents: read
+      id-token: write
       packages: write
     steps:
       - name: Checkout
@@ -142,14 +143,33 @@ jobs:
           password: ${{ github.token }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile
           push: true
           tags: ${{ env.IMAGE_TAGS }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha,scope=daemon
           cache-to: type=gha,mode=max,scope=daemon
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ env.IMAGE_TAGS }}
+        run: |
+          set -euo pipefail
+          images=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            images+=("${tag}@${DIGEST}")
+          done <<< "$TAGS"
+          cosign sign --yes "${images[@]}"
 
   deploy:
     name: Deploy Dev
