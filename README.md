@@ -49,5 +49,6 @@ cargo deny check advisories bans licenses sources
 ```
 
 `cargo deny` intentionally leaves duplicate-version warnings visible. Review
-[SECURITY.md](SECURITY.md) and [docs/public-readiness.md](docs/public-readiness.md)
-before changing repository visibility.
+[SECURITY.md](SECURITY.md) and
+[docs/public-readiness.md](docs/public-readiness.md) before changing repository
+visibility.

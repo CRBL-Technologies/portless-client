@@ -1,6 +1,8 @@
-# QUIC Transport E2E TODO
+# QUIC Transport Notes
 
-This daemon checklist mirrors the server transport checklist. The WebSocket tunnel is removed rather than maintained as a fallback, and non-transport work stays out of this milestone.
+This daemon checklist mirrors the server transport acceptance criteria. The
+WebSocket tunnel is removed rather than maintained as a fallback, and
+non-transport work stays out of this transport boundary.
 
 ## Acceptance Criteria
 
