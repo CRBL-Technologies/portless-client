@@ -73,7 +73,11 @@ jobs:
               .dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
-              .github/workflows/ci-cd.yml|docker-compose.portainer.yml)
+              .github/workflows/ci-cd.yml)
+                daemon=true
+                deploy_config=true
+                ;;
+              docker-compose.portainer.yml)
                 deploy_config=true
                 ;;
             esac
