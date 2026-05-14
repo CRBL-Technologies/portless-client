@@ -77,7 +77,7 @@ jobs:
                 daemon=true
                 deploy_config=true
                 ;;
-              docker-compose.portainer.yml)
+              docker-compose.deploy.yml)
                 deploy_config=true
                 ;;
             esac
@@ -195,12 +195,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Deploy to client Portainer
+      - name: Deploy client stack
         env:
-          PORTAINER_URL: ${{ secrets.CLIENT_PORTAINER_URL }}
-          PORTAINER_API_KEY: ${{ secrets.CLIENT_PORTAINER_API_KEY }}
-          PORTAINER_ENDPOINT_ID: ${{ secrets.CLIENT_PORTAINER_ENDPOINT_ID }}
-          PORTAINER_STACK_ID: ${{ secrets.PORTLESS_CLIENT_STACK_ID }}
+          PORTLESS_CLIENT_DEPLOY_API_URL: ${{ secrets.PORTLESS_CLIENT_DEPLOY_API_URL }}
+          PORTLESS_CLIENT_DEPLOY_API_KEY: ${{ secrets.PORTLESS_CLIENT_DEPLOY_API_KEY }}
+          PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID: ${{ secrets.PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID }}
+          PORTLESS_CLIENT_STACK_ID: ${{ secrets.PORTLESS_CLIENT_STACK_ID }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GHCR_USERNAME: ${{ github.actor }}
@@ -210,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
+          for name in PORTLESS_CLIENT_DEPLOY_API_URL PORTLESS_CLIENT_DEPLOY_API_KEY PORTLESS_CLIENT_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
             if [ -z "${!name:-}" ]; then
               echo "::error title=Deploy secret missing::Missing ${name}"
               missing=1
@@ -218,20 +218,20 @@ jobs:
           done
           [ "$missing" -eq 1 ] && exit 1
 
-          API="${PORTAINER_URL%/}/api"
+          API="${PORTLESS_CLIENT_DEPLOY_API_URL%/}/api"
           AUTH_HEADERS=(-A "crbl-ops/1.0" \
-            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            -H "X-API-Key: ${PORTLESS_CLIENT_DEPLOY_API_KEY}" \
             -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
             -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
 
-          STACK_FILE="$(cat docker-compose.portainer.yml)"
-          STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTAINER_STACK_ID}")"
+          STACK_FILE="$(cat docker-compose.deploy.yml)"
+          STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTLESS_CLIENT_STACK_ID}")"
           STACK_ENDPOINT_ID="$(echo "$STACK_RESP" | jq -r '.EndpointId // empty')"
           if [ -z "$STACK_ENDPOINT_ID" ]; then
-            STACK_ENDPOINT_ID="${PORTAINER_ENDPOINT_ID:-}"
+            STACK_ENDPOINT_ID="${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}"
           fi
           if [ -z "$STACK_ENDPOINT_ID" ]; then
-            echo "::error title=Portainer endpoint missing::Stack ${PORTAINER_STACK_ID} did not include EndpointId"
+            echo "::error title=Deploy endpoint missing::Stack ${PORTLESS_CLIENT_STACK_ID} did not include EndpointId"
             exit 1
           fi
           ENV_JSON="$(echo "$STACK_RESP" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
@@ -294,7 +294,7 @@ jobs:
             echo "Endpoint warmup ${i}/10 returned HTTP ${status}"
           done
           if [ "$endpoint_ready" -ne 1 ]; then
-            echo "::error title=Portainer endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
+            echo "::error title=Deploy endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
             exit 1
           fi
           if [ "$DAEMON_CHANGED" = "true" ]; then
@@ -305,13 +305,13 @@ jobs:
             -H "Content-Type: application/json" \
             -o "$UPDATE_RESPONSE_FILE" \
             -d @"$PAYLOAD_FILE" \
-            "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
+            "$API/stacks/${PORTLESS_CLIENT_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
 
           verified=0
           for i in 1 2 3 4 5 6 7 8 9 10; do
             UPDATED_FILE="$(curl -sf --max-time 30 \
               "${AUTH_HEADERS[@]}" \
-              "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
+              "$API/stacks/${PORTLESS_CLIENT_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
               jq -r '.StackFileContent')"
             if [ "$UPDATED_FILE" = "$STACK_FILE" ]; then
               verified=1
@@ -320,5 +320,5 @@ jobs:
             sleep 3
           done
           if [ "$verified" -ne 1 ]; then
-            echo "::warning title=Portainer deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
+            echo "::warning title=Deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
           fi

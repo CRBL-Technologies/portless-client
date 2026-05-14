@@ -1,4 +1,4 @@
-# Portless client Portainer stack template for managed deployments.
+# Portless client stack template for managed deployments.
 
 services:
   portless-daemon:
