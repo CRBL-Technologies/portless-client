@@ -1,7 +1,7 @@
 # Portless Client
 
-[![Client CI/CD](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml?query=branch%3Adev)
-[![Security](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml/badge.svg?branch=dev)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml?query=branch%3Adev)
+[![Client CI/CD](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml/badge.svg?branch=main)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/ci-cd.yml?query=branch%3Amain)
+[![Security](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/CRBL-Technologies/portless-client/actions/workflows/security.yml?query=branch%3Amain)
 
 Customer-side Portless daemon.
 
@@ -38,6 +38,22 @@ docker compose -f docker-compose.example.yml up --build
 ```
 
 Open `http://127.0.0.1:43180/` for local daemon status.
+
+## Images and Verification
+
+The public daemon image is published to
+`ghcr.io/crbl-technologies/portless-client`. Production builds publish immutable
+`sha-<commit>` tags plus `prod` and `latest`; staging builds publish `dev`.
+
+CI publishes build provenance, an SBOM, and keyless cosign signatures. Verify a
+production image with:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/CRBL-Technologies/portless-client/.github/workflows/ci-cd.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/crbl-technologies/portless-client:prod
+```
 
 ## Check
 
