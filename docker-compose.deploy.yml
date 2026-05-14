@@ -1,4 +1,4 @@
-# Portless client staging stack for the Umbrel/client Portainer environment.
+# Portless client stack template for managed deployments.
 
 services:
   portless-daemon:

@@ -1,0 +1,52 @@
+name: Security
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.6 --locked
+
+      - name: Check Rust dependency policy
+        run: cargo deny check advisories bans licenses sources
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: "1.25.x"
+          cache: false
+
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.29.1
+
+      - name: Scan git history for secrets
+        run: gitleaks git . --redact --no-banner --log-opts="--all"
