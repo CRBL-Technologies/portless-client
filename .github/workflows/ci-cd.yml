@@ -195,19 +195,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@707af61a6c8b4fa7f9476328c035208fba6b54d7 # v2.0.0
+        with:
+          version: latest-beta
+
       - name: Deploy client stack
         env:
-          PORTLESS_CLIENT_DEPLOY_API_URL: ${{ secrets.PORTLESS_CLIENT_DEPLOY_API_URL }}
-          PORTLESS_CLIENT_DEPLOY_API_KEY: ${{ secrets.PORTLESS_CLIENT_DEPLOY_API_KEY }}
-          PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID: ${{ secrets.PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID }}
-          PORTLESS_CLIENT_STACK_ID: ${{ secrets.PORTLESS_CLIENT_STACK_ID }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          OP_ENVIRONMENT_ID: ${{ vars.OP_ENVIRONMENT_ID }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
           DAEMON_CHANGED: ${{ needs.changes.outputs.daemon }}
           DEPLOY_CONFIG_CHANGED: ${{ needs.changes.outputs.deploy_config }}
         run: |
+          set -euo pipefail
+          if [ -z "${OP_ENVIRONMENT_ID:-}" ]; then
+            echo "::error title=1Password environment missing::Set OP_ENVIRONMENT_ID as a GitHub environment variable"
+            exit 1
+          fi
+
+          op run --environment "$OP_ENVIRONMENT_ID" -- bash <<'DEPLOY_SCRIPT'
           set -euo pipefail
           missing=0
           for name in PORTLESS_CLIENT_DEPLOY_API_URL PORTLESS_CLIENT_DEPLOY_API_KEY PORTLESS_CLIENT_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
@@ -322,3 +330,4 @@ jobs:
           if [ "$verified" -ne 1 ]; then
             echo "::warning title=Deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
           fi
+          DEPLOY_SCRIPT
