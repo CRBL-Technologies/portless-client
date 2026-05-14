@@ -73,7 +73,11 @@ jobs:
               .dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
-              .github/workflows/ci-cd.yml|docker-compose.portainer.yml)
+              .github/workflows/ci-cd.yml)
+                daemon=true
+                deploy_config=true
+                ;;
+              docker-compose.deploy.yml)
                 deploy_config=true
                 ;;
             esac
@@ -91,7 +95,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
 
@@ -111,6 +115,7 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.daemon == 'true'
     permissions:
       contents: read
+      id-token: write
       packages: write
     steps:
       - name: Checkout
@@ -142,14 +147,33 @@ jobs:
           password: ${{ github.token }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
           file: Dockerfile
           push: true
           tags: ${{ env.IMAGE_TAGS }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha,scope=daemon
           cache-to: type=gha,mode=max,scope=daemon
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ env.IMAGE_TAGS }}
+        run: |
+          set -euo pipefail
+          images=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            images+=("${tag}@${DIGEST}")
+          done <<< "$TAGS"
+          cosign sign --yes "${images[@]}"
 
   deploy:
     name: Deploy Dev
@@ -171,22 +195,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Deploy to client Portainer
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@707af61a6c8b4fa7f9476328c035208fba6b54d7 # v2.0.0
+        with:
+          version: latest-beta
+
+      - name: Deploy client stack
         env:
-          PORTAINER_URL: ${{ secrets.CLIENT_PORTAINER_URL }}
-          PORTAINER_API_KEY: ${{ secrets.CLIENT_PORTAINER_API_KEY }}
-          PORTAINER_ENDPOINT_ID: ${{ secrets.CLIENT_PORTAINER_ENDPOINT_ID }}
-          PORTAINER_STACK_ID: ${{ secrets.PORTLESS_CLIENT_STACK_ID }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          OP_ENVIRONMENT_ID: ${{ vars.OP_ENVIRONMENT_ID }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
           DAEMON_CHANGED: ${{ needs.changes.outputs.daemon }}
           DEPLOY_CONFIG_CHANGED: ${{ needs.changes.outputs.deploy_config }}
         run: |
           set -euo pipefail
+          if [ -z "${OP_ENVIRONMENT_ID:-}" ]; then
+            echo "::error title=1Password environment missing::Set OP_ENVIRONMENT_ID as a GitHub environment variable"
+            exit 1
+          fi
+
+          op run --environment "$OP_ENVIRONMENT_ID" -- bash <<'DEPLOY_SCRIPT'
+          set -euo pipefail
           missing=0
-          for name in PORTAINER_URL PORTAINER_API_KEY PORTAINER_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
+          for name in PORTLESS_CLIENT_DEPLOY_API_URL PORTLESS_CLIENT_DEPLOY_API_KEY PORTLESS_CLIENT_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
             if [ -z "${!name:-}" ]; then
               echo "::error title=Deploy secret missing::Missing ${name}"
               missing=1
@@ -194,20 +226,20 @@ jobs:
           done
           [ "$missing" -eq 1 ] && exit 1
 
-          API="${PORTAINER_URL%/}/api"
+          API="${PORTLESS_CLIENT_DEPLOY_API_URL%/}/api"
           AUTH_HEADERS=(-A "crbl-ops/1.0" \
-            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            -H "X-API-Key: ${PORTLESS_CLIENT_DEPLOY_API_KEY}" \
             -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
             -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
 
-          STACK_FILE="$(cat docker-compose.portainer.yml)"
-          STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTAINER_STACK_ID}")"
+          STACK_FILE="$(cat docker-compose.deploy.yml)"
+          STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTLESS_CLIENT_STACK_ID}")"
           STACK_ENDPOINT_ID="$(echo "$STACK_RESP" | jq -r '.EndpointId // empty')"
           if [ -z "$STACK_ENDPOINT_ID" ]; then
-            STACK_ENDPOINT_ID="${PORTAINER_ENDPOINT_ID:-}"
+            STACK_ENDPOINT_ID="${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}"
           fi
           if [ -z "$STACK_ENDPOINT_ID" ]; then
-            echo "::error title=Portainer endpoint missing::Stack ${PORTAINER_STACK_ID} did not include EndpointId"
+            echo "::error title=Deploy endpoint missing::Stack ${PORTLESS_CLIENT_STACK_ID} did not include EndpointId"
             exit 1
           fi
           ENV_JSON="$(echo "$STACK_RESP" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
@@ -231,7 +263,7 @@ jobs:
             --arg image "$CLIENT_IMAGE" \
             'map(select(.name | IN("PORTLESS_CLIENT_IMAGE","PORTLESS_CONTROL_URL") | not)) +
              [{"name":"PORTLESS_CLIENT_IMAGE","value":$image},
-              {"name":"PORTLESS_CONTROL_URL","value":"https://staging-connect.portless.io:8443"}]')"
+              {"name":"PORTLESS_CONTROL_URL","value":"https://connect.port-less.com"}]')"
           ENV_FILE="$(mktemp)"
           PAYLOAD_FILE="$(mktemp)"
           UPDATE_RESPONSE_FILE="$(mktemp)"
@@ -270,7 +302,7 @@ jobs:
             echo "Endpoint warmup ${i}/10 returned HTTP ${status}"
           done
           if [ "$endpoint_ready" -ne 1 ]; then
-            echo "::error title=Portainer endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
+            echo "::error title=Deploy endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
             exit 1
           fi
           if [ "$DAEMON_CHANGED" = "true" ]; then
@@ -281,13 +313,13 @@ jobs:
             -H "Content-Type: application/json" \
             -o "$UPDATE_RESPONSE_FILE" \
             -d @"$PAYLOAD_FILE" \
-            "$API/stacks/${PORTAINER_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
+            "$API/stacks/${PORTLESS_CLIENT_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
 
           verified=0
           for i in 1 2 3 4 5 6 7 8 9 10; do
             UPDATED_FILE="$(curl -sf --max-time 30 \
               "${AUTH_HEADERS[@]}" \
-              "$API/stacks/${PORTAINER_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
+              "$API/stacks/${PORTLESS_CLIENT_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
               jq -r '.StackFileContent')"
             if [ "$UPDATED_FILE" = "$STACK_FILE" ]; then
               verified=1
@@ -296,5 +328,6 @@ jobs:
             sleep 3
           done
           if [ "$verified" -ne 1 ]; then
-            echo "::warning title=Portainer deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
+            echo "::warning title=Deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
           fi
+          DEPLOY_SCRIPT

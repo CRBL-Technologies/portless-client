@@ -1,7 +1,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    io::{self, Cursor},
+    io,
     net::SocketAddr,
     path::Path,
     sync::Arc,
@@ -16,9 +16,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::StreamExt;
+use getrandom::fill as fill_random;
 use portless_contracts::portless::v1::QuicApplicationErrorCode;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
-use rand::{rngs::OsRng, RngCore};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
@@ -26,7 +26,7 @@ use reqwest::{
     Client, Method, Url,
 };
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
     RootCertStore,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -68,6 +68,8 @@ const MAX_THROUGHPUT_CHUNK_BYTES: usize = 1024 * 1024;
 const DEVICE_KEY_SECRET_FILE: &str = "device.key.secret";
 const DEVICE_KEY_ENCRYPTED_FILE: &str = "device.key.pem.enc";
 const DEVICE_KEY_PLAINTEXT_FILE: &str = "device.key.pem";
+const DEVICE_CERT_FILE: &str = "device.cert.pem";
+const TRUST_BUNDLE_FILE: &str = "trust.pem";
 const DEVICE_KEY_SECRET_ENV: &str = "PORTLESS_DEVICE_KEY_SECRET";
 const DEVICE_KEY_AAD: &[u8] = b"portless-device-key-v1";
 
@@ -87,6 +89,8 @@ pub async fn load_tunnel_context(
     control: &ControlClient,
     ui: &UiState,
 ) -> Result<TunnelContext> {
+    ensure_private_data_dir(&cfg.data_dir).await?;
+
     let trust = control.fetch_trust().await?;
     info!(trust_bytes = trust.pem.len(), "fetched trust bundle");
 
@@ -122,11 +126,9 @@ async fn ensure_identity(
     device: &DeviceConfig,
     trust: &TrustBundle,
 ) -> Result<TunnelIdentity> {
-    fs::create_dir_all(&cfg.data_dir)
-        .await
-        .context("create daemon data dir")?;
-    let cert_path = cfg.data_dir.join("device.cert.pem");
-    let trust_path = cfg.data_dir.join("trust.pem");
+    ensure_private_data_dir(&cfg.data_dir).await?;
+    let cert_path = cfg.data_dir.join(DEVICE_CERT_FILE);
+    let trust_path = cfg.data_dir.join(TRUST_BUNDLE_FILE);
 
     let existing_key = read_device_key(&cfg.data_dir).await?;
     let existing_cert = match fs::read_to_string(&cert_path).await {
@@ -137,9 +139,7 @@ async fn ensure_identity(
     if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
         if !certificate_needs_renewal(cert_pem, device) {
             write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
-            fs::write(&trust_path, &trust.pem)
-                .await
-                .context("write trust bundle")?;
+            write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
             return Ok(TunnelIdentity {
                 ca_pem: trust.pem.clone(),
                 cert_pem: cert_pem.clone(),
@@ -1288,8 +1288,7 @@ fn quic_client_config(
 }
 
 fn parse_certs_pem(raw: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = Cursor::new(raw.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(raw.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("parse certificate PEM")?;
     if certs.is_empty() {
@@ -1299,13 +1298,67 @@ fn parse_certs_pem(raw: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn parse_private_key_pem(raw: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = Cursor::new(raw.as_bytes());
-    rustls_pemfile::private_key(&mut reader)
-        .context("parse private key PEM")?
-        .ok_or_else(|| anyhow!("private key PEM did not contain a private key"))
+    PrivateKeyDer::from_pem_slice(raw.as_bytes()).context("parse private key PEM")
+}
+
+async fn ensure_private_data_dir(data_dir: &Path) -> Result<()> {
+    fs::create_dir_all(data_dir)
+        .await
+        .context("create daemon data dir")?;
+    restrict_data_dir_permissions(data_dir).await?;
+    repair_identity_permissions(data_dir).await
+}
+
+async fn repair_identity_permissions(data_dir: &Path) -> Result<()> {
+    for (filename, label) in [
+        (DEVICE_KEY_SECRET_FILE, "daemon key secret"),
+        (DEVICE_KEY_ENCRYPTED_FILE, "encrypted daemon key"),
+        (DEVICE_KEY_PLAINTEXT_FILE, "plaintext daemon key"),
+        (DEVICE_CERT_FILE, "daemon certificate"),
+        (TRUST_BUNDLE_FILE, "trust bundle"),
+    ] {
+        let path = data_dir.join(filename);
+        match restrict_file_permissions(&path, label).await {
+            Ok(()) => {}
+            Err(err) if is_not_found(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+async fn write_private_file(path: &Path, contents: impl AsRef<[u8]>, label: &str) -> Result<()> {
+    fs::write(path, contents)
+        .await
+        .with_context(|| format!("write {label}"))?;
+    restrict_file_permissions(path, label).await
+}
+
+async fn restrict_data_dir_permissions(data_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .context("restrict daemon data dir permissions")?;
+    }
+    Ok(())
+}
+
+async fn restrict_file_permissions(path: &Path, label: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("restrict {label} permissions"))?;
+    }
+    Ok(())
 }
 
 async fn read_device_key(data_dir: &Path) -> Result<Option<String>> {
+    repair_identity_permissions(data_dir).await?;
+
     let encrypted_path = data_dir.join(DEVICE_KEY_ENCRYPTED_FILE);
     match fs::read_to_string(&encrypted_path).await {
         Ok(raw) => return decrypt_device_key(data_dir, &raw).await.map(Some),
@@ -1322,11 +1375,12 @@ async fn read_device_key(data_dir: &Path) -> Result<Option<String>> {
 }
 
 async fn write_encrypted_device_key(data_dir: &Path, key_pem: &str) -> Result<()> {
+    ensure_private_data_dir(data_dir).await?;
     let secret = read_or_create_device_key_secret(data_dir).await?;
     let mut salt = [0_u8; 16];
     let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce);
+    fill_random(&mut salt)?;
+    fill_random(&mut nonce)?;
     let key = derive_device_key(&secret, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| anyhow!("build daemon key cipher: invalid key length"))?;
@@ -1348,9 +1402,12 @@ async fn write_encrypted_device_key(data_dir: &Path, key_pem: &str) -> Result<()
         ciphertext: BASE64_STANDARD.encode(ciphertext),
     };
     let encoded = serde_json::to_string_pretty(&envelope).context("encode encrypted daemon key")?;
-    fs::write(data_dir.join(DEVICE_KEY_ENCRYPTED_FILE), encoded)
-        .await
-        .context("write encrypted daemon key")?;
+    write_private_file(
+        &data_dir.join(DEVICE_KEY_ENCRYPTED_FILE),
+        encoded,
+        "encrypted daemon key",
+    )
+    .await?;
     match fs::remove_file(data_dir.join(DEVICE_KEY_PLAINTEXT_FILE)).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1403,7 +1460,7 @@ async fn read_or_create_device_key_secret(data_dir: &Path) -> Result<Vec<u8>> {
         Ok(secret) => Ok(secret),
         Err(err) if is_not_found(&err) => {
             let mut secret = [0_u8; 32];
-            OsRng.fill_bytes(&mut secret);
+            fill_random(&mut secret)?;
             let path = data_dir.join(DEVICE_KEY_SECRET_FILE);
             write_secret_file(&path, &secret).await?;
             Ok(secret.to_vec())
@@ -1433,18 +1490,7 @@ async fn read_device_key_secret(data_dir: &Path) -> Result<Vec<u8>> {
 }
 
 async fn write_secret_file(path: &Path, secret: &[u8]) -> Result<()> {
-    fs::write(path, BASE64_STANDARD.encode(secret))
-        .await
-        .context("write daemon key secret")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions)
-            .await
-            .context("restrict daemon key secret permissions")?;
-    }
-    Ok(())
+    write_private_file(path, BASE64_STANDARD.encode(secret), "daemon key secret").await
 }
 
 fn derive_device_key(secret: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
@@ -1592,12 +1638,18 @@ async fn write_identity_files(
     trust_pem: &str,
 ) -> Result<()> {
     write_encrypted_device_key(data_dir, key_pem).await?;
-    fs::write(data_dir.join("device.cert.pem"), &issued.certificate_pem)
-        .await
-        .context("write daemon certificate")?;
-    fs::write(data_dir.join("trust.pem"), trust_pem)
-        .await
-        .context("write trust bundle")?;
+    write_private_file(
+        &data_dir.join(DEVICE_CERT_FILE),
+        issued.certificate_pem.as_bytes(),
+        "daemon certificate",
+    )
+    .await?;
+    write_private_file(
+        &data_dir.join(TRUST_BUNDLE_FILE),
+        trust_pem.as_bytes(),
+        "trust bundle",
+    )
+    .await?;
     Ok(())
 }
 
@@ -1909,6 +1961,9 @@ mod tests {
         assert!(fs::metadata(dir.join(DEVICE_KEY_ENCRYPTED_FILE))
             .await
             .is_ok());
+        assert_private_path_mode(&dir, 0o700).await;
+        assert_private_path_mode(&dir.join(DEVICE_KEY_SECRET_FILE), 0o600).await;
+        assert_private_path_mode(&dir.join(DEVICE_KEY_ENCRYPTED_FILE), 0o600).await;
         assert_eq!(
             read_device_key(&dir).await.unwrap().unwrap(),
             "test-private-key"
@@ -1974,4 +2029,14 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         params.self_signed(&key_pair).unwrap().pem()
     }
+
+    #[cfg(unix)]
+    async fn assert_private_path_mode(path: &Path, expected: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, expected, "unexpected mode for {}", path.display());
+    }
+
+    #[cfg(not(unix))]
+    async fn assert_private_path_mode(_path: &Path, _expected: u32) {}
 }
