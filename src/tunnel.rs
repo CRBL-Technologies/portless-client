@@ -163,11 +163,13 @@ async fn ensure_identity(
         (None, Some(_)) => "missing cached private key",
         (None, None) => "missing cached identity",
     };
+    let mut use_replacement_request_id = force_refresh || existing_key.is_none();
     if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
         let needs_renewal = certificate_needs_renewal(cert_pem, device);
         if !force_refresh && !needs_renewal {
             if !certificate_key_matches(cert_pem, key_pem).unwrap_or(false) {
                 rotation_reason = "cached certificate key mismatch";
+                use_replacement_request_id = true;
                 warn!(
                     tunnel_id = %device.tunnel_id,
                     subdomain = %device.subdomain,
@@ -201,19 +203,54 @@ async fn ensure_identity(
     };
     let key_pem = key_pair.serialize_pem();
     let csr_pem = device_csr_pem(device, &key_pair)?;
-    let request_id = certificate_request_id(device);
+    let mut request_id = if use_replacement_request_id {
+        certificate_replacement_request_id(device)
+    } else {
+        certificate_request_id(device)
+    };
     info!(
         tunnel_id = %device.tunnel_id,
         subdomain = %device.subdomain,
         request_id = %request_id,
         rotation_reason,
         generated_new_key,
+        replacement_request = use_replacement_request_id,
         "rotating daemon certificate"
     );
-    let issued = control
+    let mut issued = control
         .request_certificate(&csr_pem, &request_id)
         .await
         .context("request daemon certificate")?;
+    if !certificate_key_matches(&issued.certificate_pem, &key_pem).unwrap_or(false) {
+        warn!(
+            tunnel_id = %device.tunnel_id,
+            subdomain = %device.subdomain,
+            request_id = %request_id,
+            "issued daemon certificate does not match private key; retrying with replacement request id"
+        );
+        let retry_request_id = certificate_replacement_request_id(device);
+        request_id = if retry_request_id == request_id {
+            format!("{retry_request_id}-retry")
+        } else {
+            retry_request_id
+        };
+        info!(
+            tunnel_id = %device.tunnel_id,
+            subdomain = %device.subdomain,
+            request_id = %request_id,
+            rotation_reason,
+            generated_new_key,
+            replacement_request = true,
+            "rotating daemon certificate"
+        );
+        issued = control
+            .request_certificate(&csr_pem, &request_id)
+            .await
+            .context("request replacement daemon certificate")?;
+    }
+    if !certificate_key_matches(&issued.certificate_pem, &key_pem).unwrap_or(false) {
+        bail!("control plane returned daemon certificate that does not match private key");
+    }
     write_identity_files(&cfg.data_dir, &key_pem, &issued, &trust.pem).await?;
     info!(
         tunnel_id = %device.tunnel_id,
@@ -1677,11 +1714,29 @@ fn certificate_request_id_at(device: &DeviceConfig, unix_seconds: i64) -> String
     )
 }
 
+fn certificate_replacement_request_id(device: &DeviceConfig) -> String {
+    certificate_replacement_request_id_at(device, now_unix_nanos())
+}
+
+fn certificate_replacement_request_id_at(device: &DeviceConfig, unix_nanos: u128) -> String {
+    format!(
+        "{}-{}-repair-{}",
+        device.tunnel_id, device.config_generation, unix_nanos
+    )
+}
+
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn now_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn certificate_matches_device(cert: &X509Certificate<'_>, device: &DeviceConfig) -> bool {
@@ -1993,6 +2048,20 @@ mod tests {
         assert_eq!(certificate_request_id_at(&device, 3_600), "tun_abc-1-h1");
         assert_eq!(certificate_request_id_at(&device, 7_199), "tun_abc-1-h1");
         assert_eq!(certificate_request_id_at(&device, 7_200), "tun_abc-1-h2");
+    }
+
+    #[test]
+    fn certificate_replacement_request_id_avoids_hourly_replay() {
+        let device = test_device_config("tun_abc", "sample");
+
+        assert_eq!(
+            certificate_replacement_request_id_at(&device, 7_200_000_000_000),
+            "tun_abc-1-repair-7200000000000"
+        );
+        assert_ne!(
+            certificate_replacement_request_id_at(&device, 7_200_000_000_000),
+            certificate_request_id_at(&device, 7_200)
+        );
     }
 
     #[test]
