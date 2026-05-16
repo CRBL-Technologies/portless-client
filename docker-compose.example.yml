@@ -4,8 +4,6 @@ services:
     env_file: .env.example
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - portless-data:/var/lib/portless
     ports:
       - "127.0.0.1:43180:43180"
     depends_on:
@@ -16,6 +14,3 @@ services:
     image: nginx:1.27-alpine
     expose:
       - "80"
-
-volumes:
-  portless-data:

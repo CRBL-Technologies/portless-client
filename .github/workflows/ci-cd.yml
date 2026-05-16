@@ -66,6 +66,9 @@ jobs:
               base="$(git rev-list --max-parents=0 "$head")"
             fi
           fi
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 "$head")"
+          fi
 
           git diff --name-only "$base" "$head" > /tmp/changed-files
           while IFS= read -r file; do
