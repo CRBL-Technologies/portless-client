@@ -1,7 +1,5 @@
-use std::{error::Error, fmt};
-
 use anyhow::{Context, Result};
-use reqwest::{header, Client, StatusCode, Url};
+use reqwest::{header, Client, Url};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -61,8 +59,7 @@ impl ControlClient {
             .base
             .join("/v1/device/certificates")
             .context("build certificate URL")?;
-        let response = self
-            .http
+        self.http
             .post(url)
             .header(header::AUTHORIZATION, &self.bearer)
             .json(&CertificateRequest {
@@ -71,11 +68,7 @@ impl ControlClient {
             })
             .send()
             .await
-            .context("request device certificate")?;
-        if response.status() == StatusCode::CONFLICT {
-            return Err(CertificateReplayConflict.into());
-        }
-        response
+            .context("request device certificate")?
             .error_for_status()
             .context("certificate response status")?
             .json()
@@ -83,17 +76,6 @@ impl ControlClient {
             .context("decode certificate response")
     }
 }
-
-#[derive(Debug)]
-pub struct CertificateReplayConflict;
-
-impl fmt::Display for CertificateReplayConflict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("certificate request was superseded")
-    }
-}
-
-impl Error for CertificateReplayConflict {}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TrustBundle {
