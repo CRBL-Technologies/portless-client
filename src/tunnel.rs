@@ -41,9 +41,7 @@ use x509_parser::prelude::*;
 
 use crate::{
     config::{Config, KeepaliveProfile},
-    control::{
-        CertificateReplayConflict, CertificateResponse, ControlClient, DeviceConfig, TrustBundle,
-    },
+    control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
     state::DaemonState,
     ui::{DaemonStatus, UiState},
 };
@@ -91,17 +89,7 @@ pub async fn load_tunnel_context(
     control: &ControlClient,
     ui: &UiState,
 ) -> Result<TunnelContext> {
-    load_tunnel_context_with_refresh(cfg, control, ui, false).await
-}
-
-async fn load_tunnel_context_with_refresh(
-    cfg: &Config,
-    control: &ControlClient,
-    ui: &UiState,
-    force_identity_refresh: bool,
-) -> Result<TunnelContext> {
     ensure_private_data_dir(&cfg.data_dir).await?;
-    let previous_state = DaemonState::load(&cfg.data_dir).await?;
 
     let trust = control.fetch_trust().await?;
     info!(trust_bytes = trust.pem.len(), "fetched trust bundle");
@@ -114,20 +102,10 @@ async fn load_tunnel_context_with_refresh(
         config_generation = device.config_generation,
         "fetched device config"
     );
+    persist_device_state(cfg, &device, ui).await?;
     ui.set_status(DaemonStatus::Reconnecting).await;
 
-    let generation_changed = previous_state
-        .config_generation
-        .is_some_and(|generation| generation != device.config_generation);
-    let identity = ensure_identity(
-        cfg,
-        control,
-        &device,
-        &trust,
-        force_identity_refresh || generation_changed,
-    )
-    .await?;
-    persist_device_state(cfg, &device, ui).await?;
+    let identity = ensure_identity(cfg, control, &device, &trust).await?;
     Ok(TunnelContext { device, identity })
 }
 
@@ -147,7 +125,6 @@ async fn ensure_identity(
     control: &ControlClient,
     device: &DeviceConfig,
     trust: &TrustBundle,
-    force_refresh: bool,
 ) -> Result<TunnelIdentity> {
     ensure_private_data_dir(&cfg.data_dir).await?;
     let cert_path = cfg.data_dir.join(DEVICE_CERT_FILE);
@@ -159,124 +136,30 @@ async fn ensure_identity(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(err).context("read daemon certificate"),
     };
-    let mut rotation_reason = match (&existing_key, &existing_cert) {
-        (Some(_), Some(_)) => "cached certificate renewal due",
-        (Some(_), None) => "missing cached certificate",
-        (None, Some(_)) => "missing cached private key",
-        (None, None) => "missing cached identity",
-    };
-    let mut use_replacement_request_id = force_refresh || existing_key.is_none();
     if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
-        let needs_renewal = certificate_needs_renewal(cert_pem, device);
-        if !force_refresh && !needs_renewal {
-            if !certificate_key_matches(cert_pem, key_pem).unwrap_or(false) {
-                rotation_reason = "cached certificate key mismatch";
-                use_replacement_request_id = true;
-                warn!(
-                    tunnel_id = %device.tunnel_id,
-                    subdomain = %device.subdomain,
-                    "cached daemon certificate does not match private key; requesting replacement"
-                );
-            } else {
-                write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
-                write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
-                return Ok(TunnelIdentity {
-                    ca_pem: trust.pem.clone(),
-                    cert_pem: cert_pem.clone(),
-                    key_pem: key_pem.clone(),
-                });
-            }
-        } else if force_refresh {
-            rotation_reason = "forced identity refresh";
-            info!(
-                tunnel_id = %device.tunnel_id,
-                subdomain = %device.subdomain,
-                "refreshing daemon certificate after control-plane identity change"
-            );
-        } else if needs_renewal {
-            rotation_reason = "cached certificate renewal due";
+        if !certificate_needs_renewal(cert_pem, device) {
+            write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
+            write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
+            return Ok(TunnelIdentity {
+                ca_pem: trust.pem.clone(),
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+            });
         }
     }
 
-    let generated_new_key = existing_key.is_none();
     let key_pair = match existing_key {
         Some(raw) => KeyPair::from_pem(&raw).context("parse existing daemon key")?,
         None => KeyPair::generate().context("generate daemon key")?,
     };
     let key_pem = key_pair.serialize_pem();
     let csr_pem = device_csr_pem(device, &key_pair)?;
-    let mut request_id = if use_replacement_request_id {
-        certificate_replacement_request_id(device)
-    } else {
-        certificate_request_id(device)
-    };
-    info!(
-        tunnel_id = %device.tunnel_id,
-        subdomain = %device.subdomain,
-        request_id = %request_id,
-        rotation_reason,
-        generated_new_key,
-        replacement_request = use_replacement_request_id,
-        "rotating daemon certificate"
-    );
-    let mut issued = match control.request_certificate(&csr_pem, &request_id).await {
-        Ok(issued) => issued,
-        Err(err) if err.downcast_ref::<CertificateReplayConflict>().is_some() => {
-            warn!(
-                tunnel_id = %device.tunnel_id,
-                subdomain = %device.subdomain,
-                request_id = %request_id,
-                "daemon certificate request was superseded; retrying with replacement request id"
-            );
-            request_id = distinct_certificate_replacement_request_id(device, &request_id);
-            info!(
-                tunnel_id = %device.tunnel_id,
-                subdomain = %device.subdomain,
-                request_id = %request_id,
-                rotation_reason,
-                generated_new_key,
-                replacement_request = true,
-                "rotating daemon certificate"
-            );
-            control
-                .request_certificate(&csr_pem, &request_id)
-                .await
-                .context("request replacement daemon certificate")?
-        }
-        Err(err) => return Err(err).context("request daemon certificate"),
-    };
-    if !certificate_key_matches(&issued.certificate_pem, &key_pem).unwrap_or(false) {
-        warn!(
-            tunnel_id = %device.tunnel_id,
-            subdomain = %device.subdomain,
-            request_id = %request_id,
-            "issued daemon certificate does not match private key; retrying with replacement request id"
-        );
-        request_id = distinct_certificate_replacement_request_id(device, &request_id);
-        info!(
-            tunnel_id = %device.tunnel_id,
-            subdomain = %device.subdomain,
-            request_id = %request_id,
-            rotation_reason,
-            generated_new_key,
-            replacement_request = true,
-            "rotating daemon certificate"
-        );
-        issued = control
-            .request_certificate(&csr_pem, &request_id)
-            .await
-            .context("request replacement daemon certificate")?;
-    }
-    if !certificate_key_matches(&issued.certificate_pem, &key_pem).unwrap_or(false) {
-        bail!("control plane returned daemon certificate that does not match private key");
-    }
+    let request_id = certificate_request_id(device);
+    let issued = control
+        .request_certificate(&csr_pem, &request_id)
+        .await
+        .context("request daemon certificate")?;
     write_identity_files(&cfg.data_dir, &key_pem, &issued, &trust.pem).await?;
-    info!(
-        tunnel_id = %device.tunnel_id,
-        subdomain = %device.subdomain,
-        request_id = %request_id,
-        "rotated daemon certificate"
-    );
 
     Ok(TunnelIdentity {
         ca_pem: trust.pem.clone(),
@@ -358,22 +241,7 @@ pub async fn run(
                     Ok(status) => {
                         ui.set_status(status).await;
                         warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
-                        if status == DaemonStatus::DeviceRevoked {
-                            match load_tunnel_context_with_refresh(&cfg, &control, &ui, true).await {
-                                Ok(updated) => {
-                                    context = updated;
-                                    attempt = 0;
-                                    Duration::ZERO
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        error = %format!("{err:#}"),
-                                        "refresh daemon certificate after revocation failed"
-                                    );
-                                    Duration::from_secs(60)
-                                }
-                            }
-                        } else if terminal_close_status(status) {
+                        if terminal_close_status(status) {
                             Duration::from_secs(60)
                         } else {
                             reconnect_delay(0)
@@ -1433,15 +1301,6 @@ fn parse_private_key_pem(raw: &str) -> Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_slice(raw.as_bytes()).context("parse private key PEM")
 }
 
-fn certificate_key_matches(cert_pem: &str, key_pem: &str) -> Result<bool> {
-    let certs = parse_certs_pem(cert_pem)?;
-    let key = parse_private_key_pem(key_pem)?;
-    let result = rustls::ClientConfig::builder()
-        .with_root_certificates(RootCertStore::empty())
-        .with_client_auth_cert(certs, key);
-    Ok(result.is_ok())
-}
-
 async fn ensure_private_data_dir(data_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)
         .await
@@ -1733,38 +1592,11 @@ fn certificate_request_id_at(device: &DeviceConfig, unix_seconds: i64) -> String
     )
 }
 
-fn certificate_replacement_request_id(device: &DeviceConfig) -> String {
-    certificate_replacement_request_id_at(device, now_unix_nanos())
-}
-
-fn distinct_certificate_replacement_request_id(device: &DeviceConfig, previous: &str) -> String {
-    let request_id = certificate_replacement_request_id(device);
-    if request_id == previous {
-        format!("{request_id}-retry")
-    } else {
-        request_id
-    }
-}
-
-fn certificate_replacement_request_id_at(device: &DeviceConfig, unix_nanos: u128) -> String {
-    format!(
-        "{}-{}-repair-{}",
-        device.tunnel_id, device.config_generation, unix_nanos
-    )
-}
-
 fn now_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-}
-
-fn now_unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 fn certificate_matches_device(cert: &X509Certificate<'_>, device: &DeviceConfig) -> bool {
@@ -2079,20 +1911,6 @@ mod tests {
     }
 
     #[test]
-    fn certificate_replacement_request_id_avoids_hourly_replay() {
-        let device = test_device_config("tun_abc", "sample");
-
-        assert_eq!(
-            certificate_replacement_request_id_at(&device, 7_200_000_000_000),
-            "tun_abc-1-repair-7200000000000"
-        );
-        assert_ne!(
-            certificate_replacement_request_id_at(&device, 7_200_000_000_000),
-            certificate_request_id_at(&device, 7_200)
-        );
-    }
-
-    #[test]
     fn cached_certificate_matching_device_is_reused() {
         let device = test_device_config("tun_abc", "sample");
         let cert_pem = test_device_certificate("tun_abc", "sample");
@@ -2115,27 +1933,6 @@ mod tests {
         let cert_pem = test_device_certificate("tun_abc", "old-sample");
 
         assert!(certificate_needs_renewal(&cert_pem, &device));
-    }
-
-    #[test]
-    fn certificate_key_match_is_detected() {
-        install_test_crypto_provider();
-        let key_pair = KeyPair::generate().unwrap();
-        let cert_pem = test_device_certificate_for_key("tun_abc", "sample", &key_pair);
-        let key_pem = key_pair.serialize_pem();
-
-        assert!(certificate_key_matches(&cert_pem, &key_pem).unwrap());
-    }
-
-    #[test]
-    fn certificate_key_mismatch_is_detected() {
-        install_test_crypto_provider();
-        let cert_key_pair = KeyPair::generate().unwrap();
-        let other_key_pair = KeyPair::generate().unwrap();
-        let cert_pem = test_device_certificate_for_key("tun_abc", "sample", &cert_key_pair);
-        let other_key_pem = other_key_pair.serialize_pem();
-
-        assert!(!certificate_key_matches(&cert_pem, &other_key_pem).unwrap());
     }
 
     #[tokio::test]
@@ -2217,20 +2014,7 @@ mod tests {
         }
     }
 
-    fn install_test_crypto_provider() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-
     fn test_device_certificate(tunnel_id: &str, subdomain: &str) -> String {
-        let key_pair = KeyPair::generate().unwrap();
-        test_device_certificate_for_key(tunnel_id, subdomain, &key_pair)
-    }
-
-    fn test_device_certificate_for_key(
-        tunnel_id: &str,
-        subdomain: &str,
-        key_pair: &KeyPair,
-    ) -> String {
         let mut params = CertificateParams::new(vec![subdomain.to_owned()]).unwrap();
         params.not_before = rcgen::date_time_ymd(2026, 1, 1);
         params.not_after = rcgen::date_time_ymd(2030, 1, 1);
@@ -2242,7 +2026,8 @@ mod tests {
                 .try_into()
                 .unwrap(),
         ));
-        params.self_signed(key_pair).unwrap().pem()
+        let key_pair = KeyPair::generate().unwrap();
+        params.self_signed(&key_pair).unwrap().pem()
     }
 
     #[cfg(unix)]
