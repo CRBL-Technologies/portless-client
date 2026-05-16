@@ -41,7 +41,9 @@ use x509_parser::prelude::*;
 
 use crate::{
     config::{Config, KeepaliveProfile},
-    control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
+    control::{
+        CertificateReplayConflict, CertificateResponse, ControlClient, DeviceConfig, TrustBundle,
+    },
     state::DaemonState,
     ui::{DaemonStatus, UiState},
 };
@@ -217,10 +219,32 @@ async fn ensure_identity(
         replacement_request = use_replacement_request_id,
         "rotating daemon certificate"
     );
-    let mut issued = control
-        .request_certificate(&csr_pem, &request_id)
-        .await
-        .context("request daemon certificate")?;
+    let mut issued = match control.request_certificate(&csr_pem, &request_id).await {
+        Ok(issued) => issued,
+        Err(err) if err.downcast_ref::<CertificateReplayConflict>().is_some() => {
+            warn!(
+                tunnel_id = %device.tunnel_id,
+                subdomain = %device.subdomain,
+                request_id = %request_id,
+                "daemon certificate request was superseded; retrying with replacement request id"
+            );
+            request_id = distinct_certificate_replacement_request_id(device, &request_id);
+            info!(
+                tunnel_id = %device.tunnel_id,
+                subdomain = %device.subdomain,
+                request_id = %request_id,
+                rotation_reason,
+                generated_new_key,
+                replacement_request = true,
+                "rotating daemon certificate"
+            );
+            control
+                .request_certificate(&csr_pem, &request_id)
+                .await
+                .context("request replacement daemon certificate")?
+        }
+        Err(err) => return Err(err).context("request daemon certificate"),
+    };
     if !certificate_key_matches(&issued.certificate_pem, &key_pem).unwrap_or(false) {
         warn!(
             tunnel_id = %device.tunnel_id,
@@ -228,12 +252,7 @@ async fn ensure_identity(
             request_id = %request_id,
             "issued daemon certificate does not match private key; retrying with replacement request id"
         );
-        let retry_request_id = certificate_replacement_request_id(device);
-        request_id = if retry_request_id == request_id {
-            format!("{retry_request_id}-retry")
-        } else {
-            retry_request_id
-        };
+        request_id = distinct_certificate_replacement_request_id(device, &request_id);
         info!(
             tunnel_id = %device.tunnel_id,
             subdomain = %device.subdomain,
@@ -1716,6 +1735,15 @@ fn certificate_request_id_at(device: &DeviceConfig, unix_seconds: i64) -> String
 
 fn certificate_replacement_request_id(device: &DeviceConfig) -> String {
     certificate_replacement_request_id_at(device, now_unix_nanos())
+}
+
+fn distinct_certificate_replacement_request_id(device: &DeviceConfig, previous: &str) -> String {
+    let request_id = certificate_replacement_request_id(device);
+    if request_id == previous {
+        format!("{request_id}-retry")
+    } else {
+        request_id
+    }
 }
 
 fn certificate_replacement_request_id_at(device: &DeviceConfig, unix_nanos: u128) -> String {
