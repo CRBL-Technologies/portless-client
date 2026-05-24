@@ -202,7 +202,22 @@ pub async fn run(
             }
         }
 
-        let remote = relay_target(&context.device.relay_address).await?;
+        let remote = match relay_target(&context.device.relay_address).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                ui.set_status(DaemonStatus::RelayUnreachable).await;
+                warn!(
+                    error = %format!("{err:#}"),
+                    relay_address = %context.device.relay_address,
+                    attempt,
+                    "resolve relay target failed"
+                );
+                let delay = reconnect_delay(attempt);
+                attempt = attempt.saturating_add(1);
+                time::sleep(delay).await;
+                continue;
+            }
+        };
         let client_config = quic_client_config(&context.identity, &cfg.keepalive_profile)?;
         ui.set_status(DaemonStatus::Reconnecting).await;
         let (endpoint, connection) = match connect_once(
@@ -1049,6 +1064,19 @@ fn same_url_host_port(left: &Url, right: &Url) -> bool {
 }
 
 async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
+    let (host, port) = parse_relay_endpoint(relay_address)?;
+    let addr = lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("resolve relay {host}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("relay host resolved to no addresses"))?;
+    Ok(RelayTarget {
+        server_name: host,
+        addr,
+    })
+}
+
+fn parse_relay_endpoint(relay_address: &str) -> Result<(String, u16)> {
     let raw = relay_address.trim();
     if raw.is_empty() {
         return Err(anyhow!("relay address is empty"));
@@ -1064,15 +1092,7 @@ async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
         .trim_matches(['[', ']'])
         .to_owned();
     let port = url.port_or_known_default().unwrap_or(443);
-    let addr = lookup_host((host.as_str(), port))
-        .await
-        .with_context(|| format!("resolve relay {host}:{port}"))?
-        .next()
-        .ok_or_else(|| anyhow!("relay host resolved to no addresses"))?;
-    Ok(RelayTarget {
-        server_name: host,
-        addr,
-    })
+    Ok((host, port))
 }
 
 fn bytes_per_second(bytes: u64, duration_ms: u64) -> u64 {
@@ -1988,6 +2008,29 @@ mod tests {
         let capped = reconnect_delay(12);
         assert!(capped >= Duration::from_secs(15));
         assert!(capped < Duration::from_secs(16));
+    }
+
+    #[test]
+    fn parses_plain_relay_endpoint_with_default_port() {
+        let (host, port) = parse_relay_endpoint("relay-ams-1.portless.io").unwrap();
+
+        assert_eq!(host, "relay-ams-1.portless.io");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parses_relay_endpoint_with_explicit_scheme_and_port() {
+        let (host, port) = parse_relay_endpoint("https://relay-ams-1.portless.io:8443").unwrap();
+
+        assert_eq!(host, "relay-ams-1.portless.io");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn rejects_empty_relay_endpoint() {
+        let err = parse_relay_endpoint(" ").unwrap_err();
+
+        assert!(format!("{err:#}").contains("relay address is empty"));
     }
 
     #[test]
