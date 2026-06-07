@@ -23,8 +23,23 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Cache cargo-deny
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-deny-0.19.6-rust-1.95
+
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.19.6 --locked
+        run: |
+          if ! command -v cargo-deny >/dev/null 2>&1 || ! cargo-deny --version | grep -q 'cargo-deny 0.19.6'; then
+            cargo install cargo-deny --version 0.19.6 --locked
+          fi
 
       - name: Check Rust dependency policy
         run: cargo deny check advisories bans licenses sources
@@ -45,8 +60,24 @@ jobs:
           go-version: "1.25.x"
           cache: false
 
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Cache gitleaks
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/go/bin/gitleaks
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-gitleaks-v8.29.1-go-1.25
+
       - name: Install gitleaks
-        run: go install github.com/zricethezav/gitleaks/v8@v8.29.1
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          if ! command -v gitleaks >/dev/null 2>&1 || ! gitleaks version | grep -q '8.29.1'; then
+            go install github.com/zricethezav/gitleaks/v8@v8.29.1
+          fi
 
       - name: Scan git history for secrets
         run: gitleaks git . --redact --no-banner --log-opts="--all"
