@@ -1,0 +1,9 @@
+FROM debian:bookworm-slim
+
+RUN useradd --system --uid 10001 --home /var/lib/portless portless \
+  && mkdir -p /var/lib/portless \
+  && chown -R portless:portless /var/lib/portless
+
+USER portless
+COPY --chmod=0755 dist/portless-daemon /usr/local/bin/portless-daemon
+ENTRYPOINT ["/usr/local/bin/portless-daemon"]
