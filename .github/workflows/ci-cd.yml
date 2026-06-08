@@ -73,11 +73,10 @@ jobs:
           git diff --name-only "$base" "$head" > /tmp/changed-files
           while IFS= read -r file; do
             case "$file" in
-              .dockerignore|Dockerfile|Cargo.toml|Cargo.lock|src/**)
+              .dockerignore|Dockerfile|Dockerfile.package|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
               .github/workflows/ci-cd.yml)
-                daemon=true
                 deploy_config=true
                 ;;
               docker-compose.deploy.yml)
@@ -136,6 +135,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Cache cargo release build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.95-daemon-release-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.95-daemon-release-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-rust-1.95-daemon-release-
+
+      - name: Build release binary in Bookworm
+        run: |
+          mkdir -p "$HOME/.cargo" dist
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/cargo \
+            -v "$HOME/.cargo:/cargo" \
+            -v "$PWD:/src" \
+            -w /src \
+            rust:1.95-bookworm \
+            cargo build --release
+          cp target/release/portless-daemon dist/portless-daemon
+
       - name: Set image tags
         run: |
           repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
@@ -166,13 +191,11 @@ jobs:
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.package
           push: true
           tags: ${{ env.IMAGE_TAGS }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=daemon
-          cache-to: type=gha,mode=max,scope=daemon
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
