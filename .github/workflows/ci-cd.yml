@@ -211,7 +211,15 @@ jobs:
             [ -z "$tag" ] && continue
             images+=("${tag}@${DIGEST}")
           done <<< "$TAGS"
-          cosign sign --yes "${images[@]}"
+          for attempt in 1 2 3; do
+            if cosign sign --yes "${images[@]}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep "$((attempt * 20))"
+          done
 
   deploy:
     name: Deploy Dev
