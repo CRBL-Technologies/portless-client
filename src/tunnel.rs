@@ -244,7 +244,7 @@ pub async fn run(
             }
         };
 
-        attempt = 0;
+        let session_started = time::Instant::now();
         ui.set_status(DaemonStatus::Connected).await;
         let renewal_delay = certificate_renewal_delay(&context.identity.cert_pem, &context.device);
         let renewal_timer = time::sleep(renewal_delay);
@@ -257,15 +257,18 @@ pub async fn run(
                         ui.set_status(status).await;
                         warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
                         if terminal_close_status(status) {
+                            attempt = 0;
                             Duration::from_secs(60)
                         } else {
-                            reconnect_delay(0)
+                            attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                            reconnect_delay(attempt)
                         }
                     }
                     Err(err) => {
                         ui.set_status(DaemonStatus::Reconnecting).await;
                         warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
-                        reconnect_delay(0)
+                        attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                        reconnect_delay(attempt)
                     }
                 }
             }
@@ -276,6 +279,7 @@ pub async fn run(
                     relay = %remote.addr,
                     "daemon certificate renewal threshold reached; reconnecting"
                 );
+                attempt = 0;
                 Duration::ZERO
             }
         };
@@ -1156,6 +1160,19 @@ fn micros_to_millis(value: u64) -> u64 {
     value / 1000
 }
 
+/// Minimum session lifetime before the reconnect backoff resets. Sessions
+/// that die sooner keep growing the backoff so a relay that fails right
+/// after the handshake is not hammered with full QUIC reconnects.
+const HEALTHY_SESSION_RESET: Duration = Duration::from_secs(30);
+
+fn next_reconnect_attempt(session_duration: Duration, attempt: u32) -> u32 {
+    if session_duration >= HEALTHY_SESSION_RESET {
+        0
+    } else {
+        attempt.saturating_add(1)
+    }
+}
+
 fn reconnect_delay(attempt: u32) -> Duration {
     let base = Duration::from_secs(1);
     let multiplier = 1_u32 << attempt.min(5);
@@ -1773,6 +1790,22 @@ mod tests {
         assert!(got
             .iter()
             .any(|header| header.name == "accept" && header.value == "text/html"));
+    }
+
+    #[test]
+    fn short_lived_sessions_grow_reconnect_backoff() {
+        assert_eq!(next_reconnect_attempt(Duration::ZERO, 0), 1);
+        assert_eq!(next_reconnect_attempt(Duration::from_secs(2), 3), 4);
+        assert_eq!(
+            next_reconnect_attempt(Duration::from_secs(1), u32::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn healthy_sessions_reset_reconnect_backoff() {
+        assert_eq!(next_reconnect_attempt(HEALTHY_SESSION_RESET, 5), 0);
+        assert_eq!(next_reconnect_attempt(Duration::from_secs(3600), 2), 0);
     }
 
     #[test]
