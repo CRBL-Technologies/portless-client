@@ -202,7 +202,7 @@ pub async fn run(
             }
         }
 
-        let remote = match relay_target(&context.device.relay_address).await {
+        let remote = match relay_target(&context.device.relay_address, attempt).await {
             Ok(remote) => remote,
             Err(err) => {
                 ui.set_status(DaemonStatus::RelayUnreachable).await;
@@ -244,7 +244,7 @@ pub async fn run(
             }
         };
 
-        attempt = 0;
+        let session_started = time::Instant::now();
         ui.set_status(DaemonStatus::Connected).await;
         let renewal_delay = certificate_renewal_delay(&context.identity.cert_pem, &context.device);
         let renewal_timer = time::sleep(renewal_delay);
@@ -257,15 +257,18 @@ pub async fn run(
                         ui.set_status(status).await;
                         warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
                         if terminal_close_status(status) {
+                            attempt = 0;
                             Duration::from_secs(60)
                         } else {
-                            reconnect_delay(0)
+                            attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                            reconnect_delay(attempt)
                         }
                     }
                     Err(err) => {
                         ui.set_status(DaemonStatus::Reconnecting).await;
                         warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
-                        reconnect_delay(0)
+                        attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                        reconnect_delay(attempt)
                     }
                 }
             }
@@ -276,6 +279,7 @@ pub async fn run(
                     relay = %remote.addr,
                     "daemon certificate renewal threshold reached; reconnecting"
                 );
+                attempt = 0;
                 Duration::ZERO
             }
         };
@@ -774,6 +778,9 @@ async fn stream_local_response(
                     started,
                     outcome: "pms_read_failed",
                 });
+                // Dropping the stream would finish it cleanly, making the
+                // truncated body look complete to the relay; reset instead.
+                let _ = send.reset(STREAM_CANCELLED);
                 return Err(err).context("read local PMS response chunk");
             }
         };
@@ -869,6 +876,7 @@ async fn stream_local_upgrade_response(
                 started,
                 outcome: "pms_upgrade_failed",
             });
+            let _ = send.reset(STREAM_CANCELLED);
             return Err(err).context("upgrade local PMS response");
         }
     };
@@ -923,6 +931,7 @@ async fn stream_local_upgrade_response(
                 started,
                 outcome: "copy_failed",
             });
+            let _ = relay_send.reset(STREAM_CANCELLED);
             return Err(err);
         }
     }
@@ -1063,17 +1072,28 @@ fn same_url_host_port(left: &Url, right: &Url) -> bool {
     same_url_hostname(left, right) && left.port_or_known_default() == right.port_or_known_default()
 }
 
-async fn relay_target(relay_address: &str) -> Result<RelayTarget> {
+async fn relay_target(relay_address: &str, attempt: u32) -> Result<RelayTarget> {
     let (host, port) = parse_relay_endpoint(relay_address)?;
-    let addr = lookup_host((host.as_str(), port))
+    let addrs: Vec<SocketAddr> = lookup_host((host.as_str(), port))
         .await
         .with_context(|| format!("resolve relay {host}:{port}"))?
-        .next()
+        .collect();
+    let addr = select_relay_addr(&addrs, attempt)
         .ok_or_else(|| anyhow!("relay host resolved to no addresses"))?;
     Ok(RelayTarget {
         server_name: host,
         addr,
     })
+}
+
+/// Rotate through every resolved address as reconnect attempts grow, so a
+/// dead first DNS answer (e.g. an unreachable address family or relay node)
+/// cannot wedge the daemon retrying the same address forever.
+fn select_relay_addr(addrs: &[SocketAddr], attempt: u32) -> Option<SocketAddr> {
+    if addrs.is_empty() {
+        return None;
+    }
+    Some(addrs[attempt as usize % addrs.len()])
 }
 
 fn parse_relay_endpoint(relay_address: &str) -> Result<(String, u16)> {
@@ -1154,6 +1174,19 @@ fn elapsed_micros(started: time::Instant) -> u64 {
 
 fn micros_to_millis(value: u64) -> u64 {
     value / 1000
+}
+
+/// Minimum session lifetime before the reconnect backoff resets. Sessions
+/// that die sooner keep growing the backoff so a relay that fails right
+/// after the handshake is not hammered with full QUIC reconnects.
+const HEALTHY_SESSION_RESET: Duration = Duration::from_secs(30);
+
+fn next_reconnect_attempt(session_duration: Duration, attempt: u32) -> u32 {
+    if session_duration >= HEALTHY_SESSION_RESET {
+        0
+    } else {
+        attempt.saturating_add(1)
+    }
 }
 
 fn reconnect_delay(attempt: u32) -> Duration {
@@ -1776,6 +1809,22 @@ mod tests {
     }
 
     #[test]
+    fn short_lived_sessions_grow_reconnect_backoff() {
+        assert_eq!(next_reconnect_attempt(Duration::ZERO, 0), 1);
+        assert_eq!(next_reconnect_attempt(Duration::from_secs(2), 3), 4);
+        assert_eq!(
+            next_reconnect_attempt(Duration::from_secs(1), u32::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn healthy_sessions_reset_reconnect_backoff() {
+        assert_eq!(next_reconnect_attempt(HEALTHY_SESSION_RESET, 5), 0);
+        assert_eq!(next_reconnect_attempt(Duration::from_secs(3600), 2), 0);
+    }
+
+    #[test]
     fn application_close_codes_match_contract_statuses() {
         assert_eq!(
             u64::from(STREAM_CANCELLED),
@@ -2008,6 +2057,105 @@ mod tests {
         let capped = reconnect_delay(12);
         assert!(capped >= Duration::from_secs(15));
         assert!(capped < Duration::from_secs(16));
+    }
+
+    #[test]
+    fn rotates_relay_addresses_across_attempts() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.0.0.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ];
+
+        assert_eq!(select_relay_addr(&addrs, 0), Some(addrs[0]));
+        assert_eq!(select_relay_addr(&addrs, 1), Some(addrs[1]));
+        assert_eq!(select_relay_addr(&addrs, 2), Some(addrs[0]));
+        assert_eq!(select_relay_addr(&[], 7), None);
+    }
+
+    async fn local_quic_pair() -> (Connection, Connection, Endpoint, Endpoint) {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        let server_config =
+            quinn::ServerConfig::with_single_cert(vec![cert_der.clone()], key_der.into()).unwrap();
+        let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config);
+
+        let connect = client.connect(server_addr, "localhost").unwrap();
+        let (daemon_conn, relay_conn) = tokio::join!(connect, async {
+            server.accept().await.unwrap().await.unwrap()
+        });
+        (daemon_conn.unwrap(), relay_conn, client, server)
+    }
+
+    async fn truncating_pms_stub() -> SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .await;
+            // Drop the socket without the terminating chunk: a truncated body.
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn pms_read_failure_resets_relay_response_stream() {
+        let stub_addr = truncating_pms_stub().await;
+        let response = Client::new()
+            .get(format!("http://{stub_addr}/library/stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let (daemon_conn, relay_conn, _client_endpoint, _server_endpoint) = local_quic_pair().await;
+        let relay_read = tokio::spawn(async move {
+            let (_send, mut recv) = relay_conn.accept_bi().await.unwrap();
+            recv.read_to_end(1 << 20).await
+        });
+
+        let (mut send, _recv) = daemon_conn.open_bi().await.unwrap();
+        let result = stream_local_response(
+            "req-1".to_owned(),
+            "GET".to_owned(),
+            "/library/stream".to_owned(),
+            response,
+            &mut send,
+            false,
+            time::Instant::now(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "truncated PMS body should error");
+        // Mirrors forward_request returning and dropping the stream.
+        drop(send);
+
+        let read = relay_read.await.unwrap();
+        assert!(
+            matches!(
+                read,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) if code == STREAM_CANCELLED
+            ),
+            "relay should see a reset, got {read:?}"
+        );
     }
 
     #[test]
