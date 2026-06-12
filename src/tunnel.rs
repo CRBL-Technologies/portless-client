@@ -4,7 +4,10 @@ use std::{
     io,
     net::SocketAddr,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -59,6 +62,8 @@ const STREAM_RELAY_DRAINING: VarInt =
 const STREAM_QUOTA_EXCEEDED: VarInt =
     VarInt::from_u32(QuicApplicationErrorCode::QuotaExceeded as u32);
 const STREAM_REVOKED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Revoked as u32);
+const FORCED_RENEWAL_FLOOR: Duration = Duration::from_secs(2 * 60 * 60);
+const CERTIFICATE_RENEWAL_RECHECK_DELAY: Duration = Duration::from_secs(60);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
 const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
@@ -250,37 +255,65 @@ pub async fn run(
         let renewal_timer = time::sleep(renewal_delay);
         tokio::pin!(renewal_timer);
         let connection_for_renewal = connection.clone();
-        let delay = tokio::select! {
-            result = serve_connection(&cfg, &http, endpoint, connection, ui.clone()) => {
-                match result {
-                    Ok(status) => {
-                        ui.set_status(status).await;
-                        warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
-                        if terminal_close_status(status) {
-                            attempt = 0;
-                            Duration::from_secs(60)
-                        } else {
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let serve_connection = serve_connection(
+            &cfg,
+            &http,
+            endpoint,
+            connection,
+            ui.clone(),
+            active_streams.clone(),
+        );
+        tokio::pin!(serve_connection);
+        let delay = loop {
+            tokio::select! {
+                result = &mut serve_connection => {
+                    break match result {
+                        Ok(status) => {
+                            ui.set_status(status).await;
+                            warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
+                            if terminal_close_status(status) {
+                                attempt = 0;
+                                Duration::from_secs(60)
+                            } else {
+                                attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                                reconnect_delay(attempt)
+                            }
+                        }
+                        Err(err) => {
+                            ui.set_status(DaemonStatus::Reconnecting).await;
+                            warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
                             attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
                             reconnect_delay(attempt)
                         }
-                    }
-                    Err(err) => {
-                        ui.set_status(DaemonStatus::Reconnecting).await;
-                        warn!(error = %format!("{err:#}"), relay = %remote.addr, "relay QUIC tunnel disconnected");
-                        attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
-                        reconnect_delay(attempt)
-                    }
+                    };
                 }
-            }
-            _ = &mut renewal_timer => {
-                ui.set_status(DaemonStatus::Reconnecting).await;
-                connection_for_renewal.close(STREAM_CANCELLED, b"daemon certificate renewal");
-                info!(
-                    relay = %remote.addr,
-                    "daemon certificate renewal threshold reached; reconnecting"
-                );
-                attempt = 0;
-                Duration::ZERO
+                _ = &mut renewal_timer => {
+                    let active_stream_count = active_streams.load(Ordering::Relaxed);
+                    let remaining_validity =
+                        certificate_remaining_validity(&context.identity.cert_pem, &context.device);
+                    if should_defer_renewal(active_stream_count, remaining_validity) {
+                        info!(
+                            relay = %remote.addr,
+                            active_streams = active_stream_count,
+                            remaining_validity_secs = remaining_validity.as_secs(),
+                            "certificate renewal deferred; active streams"
+                        );
+                        renewal_timer.as_mut().reset(
+                            time::Instant::now() + CERTIFICATE_RENEWAL_RECHECK_DELAY
+                        );
+                        continue;
+                    }
+
+                    ui.set_status(DaemonStatus::Reconnecting).await;
+                    connection_for_renewal.close(STREAM_CANCELLED, b"daemon certificate renewal");
+                    info!(
+                        relay = %remote.addr,
+                        "daemon certificate renewal threshold reached; reconnecting"
+                    );
+                    attempt = 0;
+                    break Duration::ZERO;
+                }
             }
         };
         time::sleep(delay).await;
@@ -319,6 +352,7 @@ async fn serve_connection(
     _endpoint: Endpoint,
     connection: Connection,
     ui: UiState,
+    active_streams: Arc<AtomicUsize>,
 ) -> Result<DaemonStatus> {
     loop {
         match connection.accept_bi().await {
@@ -326,7 +360,9 @@ async fn serve_connection(
                 let http = http.clone();
                 let pms_url = cfg.pms_url.clone();
                 let ui = ui.clone();
+                let active_streams = active_streams.clone();
                 tokio::spawn(async move {
+                    let _active_stream = ActiveForwardedStream::new(active_streams);
                     if let Err(err) = forward_request(http, pms_url, send, recv, ui).await {
                         warn!(error = %format!("{err:#}"), "forward QUIC request failed");
                     }
@@ -337,6 +373,24 @@ async fn serve_connection(
             }
             Err(err) => return Err(err).context("accept QUIC request stream"),
         }
+    }
+}
+
+struct ActiveForwardedStream {
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl ActiveForwardedStream {
+    fn new(active_streams: Arc<AtomicUsize>) -> Self {
+        active_streams.fetch_add(1, Ordering::Relaxed);
+        Self { active_streams }
+    }
+}
+
+impl Drop for ActiveForwardedStream {
+    fn drop(&mut self) {
+        let previous = self.active_streams.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
     }
 }
 
@@ -1623,13 +1677,44 @@ fn certificate_renewal_delay(cert_pem: &str, device: &DeviceConfig) -> Duration 
     }
 }
 
+fn certificate_remaining_validity(cert_pem: &str, device: &DeviceConfig) -> Duration {
+    let Ok(certs) = parse_certs_pem(cert_pem) else {
+        return Duration::ZERO;
+    };
+    let Some(leaf) = certs.first() else {
+        return Duration::ZERO;
+    };
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Duration::ZERO;
+    };
+    if !certificate_matches_device(&cert, device) {
+        return Duration::ZERO;
+    }
+    duration_until_certificate_expiry(&cert)
+}
+
+fn duration_until_certificate_expiry(cert: &X509Certificate<'_>) -> Duration {
+    let seconds = seconds_until_certificate_expiry(cert);
+    if seconds <= 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(seconds as u64)
+    }
+}
+
+fn should_defer_renewal(active_streams: usize, remaining_validity: Duration) -> bool {
+    active_streams > 0 && remaining_validity > FORCED_RENEWAL_FLOOR
+}
+
 fn seconds_until_certificate_renewal(cert: &X509Certificate<'_>, device: &DeviceConfig) -> i64 {
-    let seconds_left = cert
-        .validity()
+    seconds_until_certificate_expiry(cert) - renewal_threshold_seconds(&device.tunnel_id)
+}
+
+fn seconds_until_certificate_expiry(cert: &X509Certificate<'_>) -> i64 {
+    cert.validity()
         .not_after
         .timestamp()
-        .saturating_sub(now_unix_seconds());
-    seconds_left - renewal_threshold_seconds(&device.tunnel_id)
+        .saturating_sub(now_unix_seconds())
 }
 
 fn certificate_request_id(device: &DeviceConfig) -> String {
@@ -1968,6 +2053,31 @@ mod tests {
 
         assert!(threshold >= 16 * 60 * 60);
         assert!(threshold < 18 * 60 * 60);
+    }
+
+    #[test]
+    fn active_streams_defer_certificate_renewal_when_validity_is_comfortable() {
+        assert!(should_defer_renewal(
+            1,
+            FORCED_RENEWAL_FLOOR + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn idle_connection_renews_certificate_without_deferral() {
+        assert!(!should_defer_renewal(
+            0,
+            FORCED_RENEWAL_FLOOR + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn active_streams_do_not_defer_certificate_renewal_at_safety_floor() {
+        assert!(!should_defer_renewal(1, FORCED_RENEWAL_FLOOR));
+        assert!(!should_defer_renewal(
+            1,
+            FORCED_RENEWAL_FLOOR - Duration::from_secs(1)
+        ));
     }
 
     #[test]
