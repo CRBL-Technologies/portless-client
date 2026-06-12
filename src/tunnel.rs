@@ -62,8 +62,9 @@ const STREAM_RELAY_DRAINING: VarInt =
 const STREAM_QUOTA_EXCEEDED: VarInt =
     VarInt::from_u32(QuicApplicationErrorCode::QuotaExceeded as u32);
 const STREAM_REVOKED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Revoked as u32);
-const FORCED_RENEWAL_FLOOR: Duration = Duration::from_secs(2 * 60 * 60);
-const CERTIFICATE_RENEWAL_RECHECK_DELAY: Duration = Duration::from_secs(60);
+const RENEWAL_RETRY_DELAY: Duration = Duration::from_secs(60);
+const DRAIN_GRACE: Duration = Duration::from_secs(15 * 60);
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
 const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
@@ -108,7 +109,6 @@ pub async fn load_tunnel_context(
         "fetched device config"
     );
     persist_device_state(cfg, &device, ui).await?;
-    ui.set_status(DaemonStatus::Reconnecting).await;
 
     let identity = ensure_identity(cfg, control, &device, &trust).await?;
     Ok(TunnelContext { device, identity })
@@ -249,25 +249,58 @@ pub async fn run(
             }
         };
 
-        let session_started = time::Instant::now();
+        let mut remote = remote;
+        let mut endpoint = endpoint;
+        let mut connection = connection;
+        let mut session_started = time::Instant::now();
         ui.set_status(DaemonStatus::Connected).await;
-        let renewal_delay = certificate_renewal_delay(&context.identity.cert_pem, &context.device);
-        let renewal_timer = time::sleep(renewal_delay);
-        tokio::pin!(renewal_timer);
-        let connection_for_renewal = connection.clone();
-        let active_streams = Arc::new(AtomicUsize::new(0));
-        let serve_connection = serve_connection(
+        let mut renewal_timer = Box::pin(time::sleep(certificate_renewal_delay(
+            &context.identity.cert_pem,
+            &context.device,
+        )));
+        let mut active_streams = Arc::new(AtomicUsize::new(0));
+        let mut serve = Box::pin(serve_connection(
             &cfg,
             &http,
-            endpoint,
-            connection,
+            connection.clone(),
             ui.clone(),
             active_streams.clone(),
-        );
-        tokio::pin!(serve_connection);
+        ));
+        let mut renewal_attempt: Option<
+            tokio::task::JoinHandle<std::result::Result<RenewedConnection, RenewalError>>,
+        > = None;
+
+        enum ConnectionEvent {
+            Serve(Result<DaemonStatus>),
+            Renewal(
+                Box<
+                    std::result::Result<
+                        std::result::Result<RenewedConnection, RenewalError>,
+                        tokio::task::JoinError,
+                    >,
+                >,
+            ),
+            RenewalTimer,
+        }
+
         let delay = loop {
-            tokio::select! {
-                result = &mut serve_connection => {
+            let event = if let Some(renewal) = renewal_attempt.as_mut() {
+                tokio::select! {
+                    result = &mut serve => ConnectionEvent::Serve(result),
+                    result = renewal => ConnectionEvent::Renewal(Box::new(result)),
+                }
+            } else {
+                tokio::select! {
+                    result = &mut serve => ConnectionEvent::Serve(result),
+                    _ = &mut renewal_timer => ConnectionEvent::RenewalTimer,
+                }
+            };
+
+            match event {
+                ConnectionEvent::Serve(result) => {
+                    if let Some(renewal) = renewal_attempt.take() {
+                        renewal.abort();
+                    }
                     break match result {
                         Ok(status) => {
                             ui.set_status(status).await;
@@ -276,7 +309,8 @@ pub async fn run(
                                 attempt = 0;
                                 Duration::from_secs(60)
                             } else {
-                                attempt = next_reconnect_attempt(session_started.elapsed(), attempt);
+                                attempt =
+                                    next_reconnect_attempt(session_started.elapsed(), attempt);
                                 reconnect_delay(attempt)
                             }
                         }
@@ -288,36 +322,184 @@ pub async fn run(
                         }
                     };
                 }
-                _ = &mut renewal_timer => {
-                    let active_stream_count = active_streams.load(Ordering::Relaxed);
-                    let remaining_validity =
-                        certificate_remaining_validity(&context.identity.cert_pem, &context.device);
-                    if should_defer_renewal(active_stream_count, remaining_validity) {
-                        info!(
-                            relay = %remote.addr,
-                            active_streams = active_stream_count,
-                            remaining_validity_secs = remaining_validity.as_secs(),
-                            "certificate renewal deferred; active streams"
-                        );
-                        renewal_timer.as_mut().reset(
-                            time::Instant::now() + CERTIFICATE_RENEWAL_RECHECK_DELAY
-                        );
-                        continue;
-                    }
-
-                    ui.set_status(DaemonStatus::Reconnecting).await;
-                    connection_for_renewal.close(STREAM_CANCELLED, b"daemon certificate renewal");
+                ConnectionEvent::RenewalTimer => {
                     info!(
                         relay = %remote.addr,
-                        "daemon certificate renewal threshold reached; reconnecting"
+                        "daemon certificate renewal threshold reached; refreshing identity"
                     );
-                    attempt = 0;
-                    break Duration::ZERO;
+                    renewal_attempt = Some(tokio::spawn(renew_connection(
+                        cfg.clone(),
+                        control.clone(),
+                        ui.clone(),
+                    )));
+                }
+                ConnectionEvent::Renewal(result) => {
+                    renewal_attempt = None;
+                    match *result {
+                        Ok(Ok(renewed)) => {
+                            let old_remote = remote.addr;
+                            let old_endpoint = std::mem::replace(&mut endpoint, renewed.endpoint);
+                            let old_connection =
+                                std::mem::replace(&mut connection, renewed.connection);
+                            let old_active_streams = std::mem::replace(
+                                &mut active_streams,
+                                Arc::new(AtomicUsize::new(0)),
+                            );
+                            drop(serve);
+                            spawn_connection_drain(
+                                old_endpoint,
+                                old_connection,
+                                old_active_streams,
+                                old_remote,
+                            );
+
+                            context = renewed.context;
+                            remote = renewed.remote;
+                            session_started = time::Instant::now();
+                            renewal_timer = Box::pin(time::sleep(certificate_renewal_delay(
+                                &context.identity.cert_pem,
+                                &context.device,
+                            )));
+                            serve = Box::pin(serve_connection(
+                                &cfg,
+                                &http,
+                                connection.clone(),
+                                ui.clone(),
+                                active_streams.clone(),
+                            ));
+                            attempt = 0;
+                            info!(
+                                old_relay = %old_remote,
+                                relay = %remote.addr,
+                                "daemon certificate renewed; switched relay connection"
+                            );
+                        }
+                        Ok(Err(RenewalError::Refresh(err))) => {
+                            warn!(
+                                error = %format!("{err:#}"),
+                                retry_secs = RENEWAL_RETRY_DELAY.as_secs(),
+                                "refresh daemon certificate failed; retrying"
+                            );
+                            renewal_timer
+                                .as_mut()
+                                .reset(time::Instant::now() + RENEWAL_RETRY_DELAY);
+                        }
+                        Ok(Err(RenewalError::Connect(err))) => {
+                            warn!(
+                                error = %format!("{err:#}"),
+                                retry_secs = RENEWAL_RETRY_DELAY.as_secs(),
+                                "daemon certificate renewal connection failed; retrying"
+                            );
+                            renewal_timer
+                                .as_mut()
+                                .reset(time::Instant::now() + RENEWAL_RETRY_DELAY);
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                retry_secs = RENEWAL_RETRY_DELAY.as_secs(),
+                                "daemon certificate renewal task failed; retrying"
+                            );
+                            renewal_timer
+                                .as_mut()
+                                .reset(time::Instant::now() + RENEWAL_RETRY_DELAY);
+                        }
+                    }
                 }
             }
         };
+        drop(serve);
+        drop(connection);
+        drop(endpoint);
+        if let Some(renewal) = renewal_attempt {
+            renewal.abort();
+        }
         time::sleep(delay).await;
     }
+}
+
+struct RenewedConnection {
+    context: TunnelContext,
+    remote: RelayTarget,
+    endpoint: Endpoint,
+    connection: Connection,
+}
+
+enum RenewalError {
+    Refresh(anyhow::Error),
+    Connect(anyhow::Error),
+}
+
+async fn renew_connection(
+    cfg: Config,
+    control: ControlClient,
+    ui: UiState,
+) -> std::result::Result<RenewedConnection, RenewalError> {
+    let context = load_tunnel_context(&cfg, &control, &ui)
+        .await
+        .map_err(RenewalError::Refresh)?;
+    let client_config = quic_client_config(&context.identity, &cfg.keepalive_profile)
+        .map_err(RenewalError::Connect)?;
+    let remote = relay_target(&context.device.relay_address, 0)
+        .await
+        .map_err(RenewalError::Connect)?;
+    let (endpoint, connection) = connect_once(
+        &context.device,
+        &client_config,
+        &remote,
+        &cfg.keepalive_profile,
+    )
+    .await
+    .map_err(RenewalError::Connect)?;
+
+    Ok(RenewedConnection {
+        context,
+        remote,
+        endpoint,
+        connection,
+    })
+}
+
+fn spawn_connection_drain(
+    endpoint: Endpoint,
+    connection: Connection,
+    active_streams: Arc<AtomicUsize>,
+    relay: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let started = time::Instant::now();
+        loop {
+            let active_stream_count = active_streams.load(Ordering::Relaxed);
+            if drain_should_close(active_stream_count, started.elapsed()) {
+                // A stream opened just before the relay swap but not yet accepted
+                // can be cancelled here.
+                connection.close(STREAM_CANCELLED, b"daemon certificate renewal");
+                if active_stream_count == 0 {
+                    info!(
+                        relay = %relay,
+                        drained_secs = started.elapsed().as_secs(),
+                        "drained superseded relay connection"
+                    );
+                } else {
+                    info!(
+                        relay = %relay,
+                        active_streams = active_stream_count,
+                        drain_grace_secs = DRAIN_GRACE.as_secs(),
+                        "closed superseded relay connection after drain grace"
+                    );
+                }
+                // The endpoint must live until drain completion or Quinn closes the connection.
+                drop(endpoint);
+                break;
+            }
+
+            time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    });
+}
+
+fn drain_should_close(active_streams: usize, elapsed: Duration) -> bool {
+    active_streams == 0 || elapsed >= DRAIN_GRACE
 }
 
 async fn connect_once(
@@ -349,7 +531,6 @@ async fn connect_once(
 async fn serve_connection(
     cfg: &Config,
     http: &Client,
-    _endpoint: Endpoint,
     connection: Connection,
     ui: UiState,
     active_streams: Arc<AtomicUsize>,
@@ -1677,35 +1858,6 @@ fn certificate_renewal_delay(cert_pem: &str, device: &DeviceConfig) -> Duration 
     }
 }
 
-fn certificate_remaining_validity(cert_pem: &str, device: &DeviceConfig) -> Duration {
-    let Ok(certs) = parse_certs_pem(cert_pem) else {
-        return Duration::ZERO;
-    };
-    let Some(leaf) = certs.first() else {
-        return Duration::ZERO;
-    };
-    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
-        return Duration::ZERO;
-    };
-    if !certificate_matches_device(&cert, device) {
-        return Duration::ZERO;
-    }
-    duration_until_certificate_expiry(&cert)
-}
-
-fn duration_until_certificate_expiry(cert: &X509Certificate<'_>) -> Duration {
-    let seconds = seconds_until_certificate_expiry(cert);
-    if seconds <= 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(seconds as u64)
-    }
-}
-
-fn should_defer_renewal(active_streams: usize, remaining_validity: Duration) -> bool {
-    active_streams > 0 && remaining_validity > FORCED_RENEWAL_FLOOR
-}
-
 fn seconds_until_certificate_renewal(cert: &X509Certificate<'_>, device: &DeviceConfig) -> i64 {
     seconds_until_certificate_expiry(cert) - renewal_threshold_seconds(&device.tunnel_id)
 }
@@ -2056,28 +2208,10 @@ mod tests {
     }
 
     #[test]
-    fn active_streams_defer_certificate_renewal_when_validity_is_comfortable() {
-        assert!(should_defer_renewal(
-            1,
-            FORCED_RENEWAL_FLOOR + Duration::from_secs(60)
-        ));
-    }
-
-    #[test]
-    fn idle_connection_renews_certificate_without_deferral() {
-        assert!(!should_defer_renewal(
-            0,
-            FORCED_RENEWAL_FLOOR + Duration::from_secs(60)
-        ));
-    }
-
-    #[test]
-    fn active_streams_do_not_defer_certificate_renewal_at_safety_floor() {
-        assert!(!should_defer_renewal(1, FORCED_RENEWAL_FLOOR));
-        assert!(!should_defer_renewal(
-            1,
-            FORCED_RENEWAL_FLOOR - Duration::from_secs(1)
-        ));
+    fn drain_closes_when_idle_or_grace_expires() {
+        assert!(drain_should_close(0, Duration::ZERO));
+        assert!(!drain_should_close(1, DRAIN_GRACE - Duration::from_secs(1)));
+        assert!(drain_should_close(1, DRAIN_GRACE));
     }
 
     #[test]
@@ -2292,11 +2426,11 @@ mod tests {
     }
 
     #[test]
-    fn residential_keepalive_profile_detects_dead_relay_quickly() {
+    fn residential_keepalive_profile_rides_out_short_network_blips() {
         let profile = KeepaliveProfile::Residential;
 
         assert_eq!(profile.quic_keep_alive_interval(), Duration::from_secs(3));
-        assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(12));
+        assert_eq!(profile.quic_max_idle_timeout(), Duration::from_secs(30));
         assert_eq!(profile.quic_connect_timeout(), Duration::from_secs(4));
         assert_eq!(profile.relay_hello_timeout(), Duration::from_secs(5));
     }
