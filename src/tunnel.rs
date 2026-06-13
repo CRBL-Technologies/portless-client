@@ -33,6 +33,7 @@ use rustls::{
     RootCertStore,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::{self as tokio_io, AsyncWriteExt},
@@ -159,7 +160,7 @@ async fn ensure_identity(
     };
     let key_pem = key_pair.serialize_pem();
     let csr_pem = device_csr_pem(device, &key_pair)?;
-    let request_id = certificate_request_id(device);
+    let request_id = certificate_request_id(device, &key_pair);
     let issued = control
         .request_certificate(&csr_pem, &request_id)
         .await
@@ -1869,17 +1870,39 @@ fn seconds_until_certificate_expiry(cert: &X509Certificate<'_>) -> i64 {
         .saturating_sub(now_unix_seconds())
 }
 
-fn certificate_request_id(device: &DeviceConfig) -> String {
-    certificate_request_id_at(device, now_unix_seconds())
+fn certificate_request_id(device: &DeviceConfig, key_pair: &KeyPair) -> String {
+    certificate_request_id_at(device, key_pair, now_unix_seconds())
 }
 
-fn certificate_request_id_at(device: &DeviceConfig, unix_seconds: i64) -> String {
+fn certificate_request_id_at(
+    device: &DeviceConfig,
+    key_pair: &KeyPair,
+    unix_seconds: i64,
+) -> String {
+    let key_fingerprint = certificate_request_key_fingerprint(key_pair);
     format!(
-        "{}-{}-h{}",
+        "{}-{}-h{}-k{}",
         device.tunnel_id,
         device.config_generation,
-        unix_seconds.div_euclid(60 * 60)
+        unix_seconds.div_euclid(60 * 60),
+        key_fingerprint,
     )
+}
+
+fn certificate_request_key_fingerprint(key_pair: &KeyPair) -> String {
+    let digest = Sha256::digest(key_pair.public_key_der());
+    hex_prefix(&digest, 8)
+}
+
+fn hex_prefix(bytes: &[u8], len: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let max = len.min(bytes.len());
+    let mut out = String::with_capacity(max * 2);
+    for byte in &bytes[..max] {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn now_unix_seconds() -> i64 {
@@ -2217,10 +2240,33 @@ mod tests {
     #[test]
     fn certificate_request_id_rotates_by_hour() {
         let device = test_device_config("tun_abc", "sample");
+        let key_pair = KeyPair::generate().unwrap();
+        let key_suffix = format!("-k{}", certificate_request_key_fingerprint(&key_pair));
 
-        assert_eq!(certificate_request_id_at(&device, 3_600), "tun_abc-1-h1");
-        assert_eq!(certificate_request_id_at(&device, 7_199), "tun_abc-1-h1");
-        assert_eq!(certificate_request_id_at(&device, 7_200), "tun_abc-1-h2");
+        assert_eq!(
+            certificate_request_id_at(&device, &key_pair, 3_600),
+            format!("tun_abc-1-h1{key_suffix}")
+        );
+        assert_eq!(
+            certificate_request_id_at(&device, &key_pair, 7_199),
+            format!("tun_abc-1-h1{key_suffix}")
+        );
+        assert_eq!(
+            certificate_request_id_at(&device, &key_pair, 7_200),
+            format!("tun_abc-1-h2{key_suffix}")
+        );
+    }
+
+    #[test]
+    fn certificate_request_id_changes_when_key_changes() {
+        let device = test_device_config("tun_abc", "sample");
+        let first_key = KeyPair::generate().unwrap();
+        let second_key = KeyPair::generate().unwrap();
+
+        assert_ne!(
+            certificate_request_id_at(&device, &first_key, 3_600),
+            certificate_request_id_at(&device, &second_key, 3_600)
+        );
     }
 
     #[test]
