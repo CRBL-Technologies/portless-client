@@ -14,3 +14,8 @@ services:
       PORTLESS_KEEPALIVE_PROFILE: ${PORTLESS_KEEPALIVE_PROFILE:-residential}
       PORTLESS_UI_ADDR: ${PORTLESS_UI_ADDR:-127.0.0.1:43180}
       RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - portless-data:/var/lib/portless
+
+volumes:
+  portless-data:
