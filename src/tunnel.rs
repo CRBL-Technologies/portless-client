@@ -1627,9 +1627,17 @@ async fn restrict_data_dir_permissions(data_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
-            .await
-            .context("restrict daemon data dir permissions")?;
+        match fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                warn!(
+                    path = %data_dir.display(),
+                    error = %err,
+                    "daemon data dir permissions could not be restricted; continuing because some Docker mounts disallow chmod"
+                );
+            }
+            Err(err) => return Err(err).context("restrict daemon data dir permissions"),
+        }
     }
     Ok(())
 }
