@@ -30,7 +30,11 @@ impl KeepaliveProfile {
 
     pub fn quic_max_idle_timeout(&self) -> Duration {
         match self {
-            Self::Residential => Duration::from_secs(12),
+            // 30s rides out short residential blips and CGNAT churn without
+            // killing active streams; dead-relay detection slows accordingly,
+            // which is acceptable because relay failures are rare. The relay
+            // allows 60s, so the client value stays the binding one.
+            Self::Residential => Duration::from_secs(30),
             Self::Cellular => Duration::from_secs(30),
             Self::Conservative => Duration::from_secs(60),
         }
