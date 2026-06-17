@@ -39,6 +39,44 @@ docker compose -f docker-compose.example.yml up --build
 
 Open `http://127.0.0.1:43180/` for local daemon status.
 
+## Managed Portainer Deployments
+
+`docker-compose.deploy.yml` is the Portainer stack template used by CI. The
+stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`; CI only
+updates the stack file and `PORTLESS_CLIENT_IMAGE`.
+
+Required stack environment:
+
+- `PORTLESS_DEVICE_TOKEN`
+- `PORTLESS_CONTROL_URL`
+- `PORTLESS_PMS_URL`
+- `PORTLESS_UI_ADDR`
+- `PORTLESS_CONTAINER_NAME`
+- `PORTLESS_CLIENT_IMAGE`
+
+The GitHub `staging` and `production` environments must provide:
+
+- `OP_SERVICE_ACCOUNT_TOKEN` as a secret.
+- `OP_ENVIRONMENT_ID`
+- `PORTLESS_CLIENT_NAS_DEPLOY_API_URL`
+- `PORTLESS_CLIENT_NAS_DEPLOY_API_KEY` as a secret.
+- `PORTLESS_CLIENT_NAS_STACK_ID`
+- `PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID`
+
+The 1Password Environment referenced by `OP_ENVIRONMENT_ID` provides the
+primary deploy target:
+
+- `PORTLESS_CLIENT_DEPLOY_API_URL`
+- `PORTLESS_CLIENT_DEPLOY_API_KEY`
+- `PORTLESS_CLIENT_STACK_ID`
+- `CF_ACCESS_CLIENT_ID`
+- `CF_ACCESS_CLIENT_SECRET`
+
+`main` publishes the production image but does not deploy it automatically.
+`dev` deploys both configured staging targets. Production deployment is manual:
+run the `Deploy Production Client` workflow from GitHub after the main CI run
+has published the image you want to ship.
+
 ## Images and Verification
 
 The public daemon image is published to
