@@ -1490,10 +1490,10 @@ fn serializable_response_headers(
 
 fn should_preserve_response_content_length(method: &str, path_query: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")
-        || (method.eq_ignore_ascii_case("GET") && is_plex_download_media_path(path_query))
+        || (method.eq_ignore_ascii_case("GET") && is_plex_media_response_path(path_query))
 }
 
-fn is_plex_download_media_path(path_query: &str) -> bool {
+fn is_plex_media_response_path(path_query: &str) -> bool {
     let path = path_query
         .split_once('?')
         .map_or(path_query, |(path, _)| path);
@@ -1502,10 +1502,29 @@ fn is_plex_download_media_path(path_query: &str) -> bool {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
-    matches!(
-        segments.as_slice(),
-        ["downloadQueue", _, "item", _, "media"]
-    )
+    match segments.as_slice() {
+        ["downloadQueue", _, "item", _, "media"] => true,
+        [kind, ":", "transcode", .., file] if is_transcode_kind(kind) => {
+            is_plex_transcode_media_file(file)
+        }
+        _ => false,
+    }
+}
+
+fn is_transcode_kind(kind: &str) -> bool {
+    kind == "video" || kind == "music"
+}
+
+fn is_plex_transcode_media_file(file: &str) -> bool {
+    file.ends_with(".aac")
+        || file.ends_with(".m3u8")
+        || file.ends_with(".m4a")
+        || file.ends_with(".m4s")
+        || file.ends_with(".mp3")
+        || file.ends_with(".mp4")
+        || file.ends_with(".mpd")
+        || file.ends_with(".ts")
+        || file.ends_with(".webm")
 }
 
 fn is_hop_by_hop_response(name: &HeaderName, preserve_content_length: bool) -> bool {
@@ -2223,10 +2242,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_plex_transcode_media_get_response_content_length() {
+        assert!(should_preserve_response_content_length(
+            "GET",
+            "/video/:/transcode/universal/session/qvb5vmk1jkgru5m8of7yk99b/0/560.m4s"
+        ));
+        assert!(should_preserve_response_content_length(
+            "GET",
+            "/video/:/transcode/universal/start.mpd?X-Plex-Token=redacted"
+        ));
+    }
+
+    #[test]
     fn strips_generic_get_response_content_length() {
         assert!(!should_preserve_response_content_length(
             "GET",
             "/library/parts/7490/file.mp4"
+        ));
+        assert!(!should_preserve_response_content_length(
+            "GET",
+            "/video/:/transcode/universal/decision?X-Plex-Token=redacted"
         ));
     }
 
