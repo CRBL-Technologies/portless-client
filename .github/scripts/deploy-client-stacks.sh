@@ -81,6 +81,8 @@ deploy_stack() {
   local client_image
   if [ "${DAEMON_CHANGED}" = "true" ]; then
     client_image="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
+  elif [ "${PORTLESS_CLIENT_USE_DEFAULT_IMAGE:-}" = "true" ]; then
+    client_image="$default_image"
   else
     client_image="$(current_env_value PORTLESS_CLIENT_IMAGE)"
     if [ -z "$client_image" ] || [ "$client_image" = "null" ]; then
