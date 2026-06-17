@@ -72,8 +72,10 @@ primary deploy target:
 - `CF_ACCESS_CLIENT_ID`
 - `CF_ACCESS_CLIENT_SECRET`
 
-`main` deploys the configured production target. `dev` deploys both configured
-staging targets.
+`main` publishes the production image but does not deploy it automatically.
+`dev` deploys both configured staging targets. Production deployment is manual:
+run the `Deploy Production Client` workflow from GitHub after the main CI run
+has published the image you want to ship.
 
 ## Images and Verification
 

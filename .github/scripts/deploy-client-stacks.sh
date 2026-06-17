@@ -19,13 +19,19 @@ urlencode() {
 
 stack_file="$(cat docker-compose.deploy.yml)"
 repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME}}"
 
-if [ "${GITHUB_REF_NAME}" = "main" ]; then
+if [ "$deploy_target" = "main" ] || [ "$deploy_target" = "production" ]; then
   default_image="ghcr.io/${repo_lc}:prod"
-  nas_target_name="production-nas"
-else
+  nas_target_name="production"
+  deploy_primary_staging=0
+elif [ "$deploy_target" = "dev" ] || [ "$deploy_target" = "staging" ]; then
   default_image="ghcr.io/${repo_lc}:dev"
   nas_target_name="staging-nas"
+  deploy_primary_staging=1
+else
+  echo "::error title=Deploy target invalid::Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
+  exit 1
 fi
 
 deploy_stack() {
@@ -173,7 +179,7 @@ deploy_stack() {
   rm -f "$env_file" "$payload_file" "$update_response_file"
 }
 
-if [ "${GITHUB_REF_NAME}" = "dev" ]; then
+if [ "$deploy_primary_staging" -eq 1 ]; then
   require_vars \
     PORTLESS_CLIENT_DEPLOY_API_URL \
     PORTLESS_CLIENT_DEPLOY_API_KEY \
