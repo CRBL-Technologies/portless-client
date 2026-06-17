@@ -76,7 +76,7 @@ jobs:
               .dockerignore|Dockerfile|Dockerfile.package|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
-              .github/workflows/ci-cd.yml)
+              .github/scripts/deploy-client-stacks.sh|.github/workflows/ci-cd.yml|.github/workflows/deploy-production.yml)
                 deploy_config=true
                 ;;
               docker-compose.deploy.yml)
@@ -222,11 +222,12 @@ jobs:
           done
 
   deploy:
-    name: Deploy Dev
+    name: Deploy Client
     runs-on: ubuntu-latest
     needs: [test, changes, docker]
     if: >-
       always() &&
+      github.event_name == 'push' &&
       github.ref_name == 'dev' &&
       needs.test.result == 'success' &&
       needs.changes.outputs.deploy == 'true' &&
@@ -250,130 +251,22 @@ jobs:
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           OP_ENVIRONMENT_ID: ${{ vars.OP_ENVIRONMENT_ID }}
+          PORTLESS_CLIENT_NAS_DEPLOY_API_URL: ${{ vars.PORTLESS_CLIENT_NAS_DEPLOY_API_URL }}
+          PORTLESS_CLIENT_NAS_DEPLOY_API_KEY: ${{ secrets.PORTLESS_CLIENT_NAS_DEPLOY_API_KEY }}
+          PORTLESS_CLIENT_NAS_STACK_ID: ${{ vars.PORTLESS_CLIENT_NAS_STACK_ID }}
+          PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID: ${{ vars.PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
           DAEMON_CHANGED: ${{ needs.changes.outputs.daemon }}
           DEPLOY_CONFIG_CHANGED: ${{ needs.changes.outputs.deploy_config }}
         run: |
           set -euo pipefail
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+            echo "::error title=1Password token missing::Set OP_SERVICE_ACCOUNT_TOKEN as a GitHub environment secret"
+            exit 1
+          fi
           if [ -z "${OP_ENVIRONMENT_ID:-}" ]; then
             echo "::error title=1Password environment missing::Set OP_ENVIRONMENT_ID as a GitHub environment variable"
             exit 1
           fi
-
-          op run --environment "$OP_ENVIRONMENT_ID" -- bash <<'DEPLOY_SCRIPT'
-          set -euo pipefail
-          missing=0
-          for name in PORTLESS_CLIENT_DEPLOY_API_URL PORTLESS_CLIENT_DEPLOY_API_KEY PORTLESS_CLIENT_STACK_ID CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN; do
-            if [ -z "${!name:-}" ]; then
-              echo "::error title=Deploy secret missing::Missing ${name}"
-              missing=1
-            fi
-          done
-          [ "$missing" -eq 1 ] && exit 1
-
-          API="${PORTLESS_CLIENT_DEPLOY_API_URL%/}/api"
-          AUTH_HEADERS=(-A "crbl-ops/1.0" \
-            -H "X-API-Key: ${PORTLESS_CLIENT_DEPLOY_API_KEY}" \
-            -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
-            -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
-
-          STACK_FILE="$(cat docker-compose.deploy.yml)"
-          STACK_RESP="$(curl -sf --max-time 30 "${AUTH_HEADERS[@]}" "$API/stacks/${PORTLESS_CLIENT_STACK_ID}")"
-          STACK_ENDPOINT_ID="$(echo "$STACK_RESP" | jq -r '.EndpointId // empty')"
-          if [ -z "$STACK_ENDPOINT_ID" ]; then
-            STACK_ENDPOINT_ID="${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}"
-          fi
-          if [ -z "$STACK_ENDPOINT_ID" ]; then
-            echo "::error title=Deploy endpoint missing::Stack ${PORTLESS_CLIENT_STACK_ID} did not include EndpointId"
-            exit 1
-          fi
-          ENV_JSON="$(echo "$STACK_RESP" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
-          repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
-
-          current_env_value() {
-            name="$1"
-            echo "$ENV_JSON" | jq -r --arg name "$name" '.[]? | select(.name == $name) | .value' | tail -n 1
-          }
-
-          if [ "$DAEMON_CHANGED" = "true" ]; then
-            CLIENT_IMAGE="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
-          else
-            CLIENT_IMAGE="$(current_env_value PORTLESS_CLIENT_IMAGE)"
-            if [ -z "$CLIENT_IMAGE" ] || [ "$CLIENT_IMAGE" = "null" ]; then
-              CLIENT_IMAGE="ghcr.io/${repo_lc}:dev"
-            fi
-          fi
-
-          ENV_JSON="$(echo "$ENV_JSON" | jq -c \
-            --arg image "$CLIENT_IMAGE" \
-            'map(select(.name | IN("PORTLESS_CLIENT_IMAGE","PORTLESS_CONTROL_URL") | not)) +
-             [{"name":"PORTLESS_CLIENT_IMAGE","value":$image},
-              {"name":"PORTLESS_CONTROL_URL","value":"https://connect.port-less.com"}]')"
-          ENV_FILE="$(mktemp)"
-          PAYLOAD_FILE="$(mktemp)"
-          UPDATE_RESPONSE_FILE="$(mktemp)"
-          printf '%s' "$ENV_JSON" > "$ENV_FILE"
-          jq -n --arg file "$STACK_FILE" --slurpfile env "$ENV_FILE" \
-            '{stackFileContent: $file, env: $env[0], pullImage: true}' > "$PAYLOAD_FILE"
-
-          urlencode() {
-            jq -rn --arg value "$1" '$value | @uri'
-          }
-
-          pull_image() {
-            image="$1"
-            repo="${image%:*}"
-            tag="${image##*:}"
-            registry_auth="$(jq -nc \
-              --arg username "$GHCR_USERNAME" \
-              --arg password "$GHCR_TOKEN" \
-              '{"username":$username,"password":$password,"serveraddress":"ghcr.io"}' | base64 -w0)"
-            curl -sf --max-time 300 -X POST \
-              "${AUTH_HEADERS[@]}" \
-              -H "X-Registry-Auth: ${registry_auth}" \
-              -o /tmp/portless-image-pull.log \
-              "$API/endpoints/${STACK_ENDPOINT_ID}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
-          }
-
-          endpoint_ready=0
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ "$i" -gt 1 ] && sleep 15
-            status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
-              "${AUTH_HEADERS[@]}" "$API/endpoints/${STACK_ENDPOINT_ID}/docker/info")"
-            if [ "$status" -lt 400 ]; then
-              endpoint_ready=1
-              break
-            fi
-            echo "Endpoint warmup ${i}/10 returned HTTP ${status}"
-          done
-          if [ "$endpoint_ready" -ne 1 ]; then
-            echo "::error title=Deploy endpoint unavailable::Endpoint ${STACK_ENDPOINT_ID} did not become ready"
-            exit 1
-          fi
-          if [ "$DAEMON_CHANGED" = "true" ]; then
-            pull_image "$CLIENT_IMAGE"
-          fi
-          curl -sf --max-time 180 -X PUT \
-            "${AUTH_HEADERS[@]}" \
-            -H "Content-Type: application/json" \
-            -o "$UPDATE_RESPONSE_FILE" \
-            -d @"$PAYLOAD_FILE" \
-            "$API/stacks/${PORTLESS_CLIENT_STACK_ID}?endpointId=${STACK_ENDPOINT_ID}"
-
-          verified=0
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            UPDATED_FILE="$(curl -sf --max-time 30 \
-              "${AUTH_HEADERS[@]}" \
-              "$API/stacks/${PORTLESS_CLIENT_STACK_ID}/file?endpointId=${STACK_ENDPOINT_ID}" |
-              jq -r '.StackFileContent')"
-            if [ "$UPDATED_FILE" = "$STACK_FILE" ]; then
-              verified=1
-              break
-            fi
-            sleep 3
-          done
-          if [ "$verified" -ne 1 ]; then
-            echo "::warning title=Deploy verification delayed::Stored stack file did not match repository compose file within the verification window"
-          fi
-          DEPLOY_SCRIPT
+          op run --environment "$OP_ENVIRONMENT_ID" -- bash .github/scripts/deploy-client-stacks.sh
