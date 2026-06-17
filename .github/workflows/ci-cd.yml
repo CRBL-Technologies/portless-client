@@ -76,7 +76,7 @@ jobs:
               .dockerignore|Dockerfile|Dockerfile.package|Cargo.toml|Cargo.lock|src/**)
                 daemon=true
                 ;;
-              .github/workflows/ci-cd.yml)
+              .github/scripts/deploy-client-stacks.sh|.github/workflows/ci-cd.yml|.github/workflows/deploy-production.yml)
                 deploy_config=true
                 ;;
               docker-compose.deploy.yml)
@@ -227,13 +227,12 @@ jobs:
     needs: [test, changes, docker]
     if: >-
       always() &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.ref_name == 'dev' || github.ref_name == 'main') &&
+      github.event_name == 'push' &&
+      github.ref_name == 'dev' &&
       needs.test.result == 'success' &&
       needs.changes.outputs.deploy == 'true' &&
       (needs.docker.result == 'success' || needs.docker.result == 'skipped')
-    environment:
-      name: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    environment: staging
     permissions:
       contents: read
       packages: read
