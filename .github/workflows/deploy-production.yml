@@ -36,6 +36,7 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
           DAEMON_CHANGED: "false"
           DEPLOY_CONFIG_CHANGED: "false"
+          PORTLESS_CLIENT_USE_DEFAULT_IMAGE: "true"
         run: |
           set -euo pipefail
           if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
