@@ -64,7 +64,7 @@ const STREAM_QUOTA_EXCEEDED: VarInt =
     VarInt::from_u32(QuicApplicationErrorCode::QuotaExceeded as u32);
 const STREAM_REVOKED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Revoked as u32);
 const RENEWAL_RETRY_DELAY: Duration = Duration::from_secs(60);
-const DRAIN_GRACE: Duration = Duration::from_secs(15 * 60);
+const DRAIN_IDLE_GUARD: Duration = Duration::from_secs(5);
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
@@ -469,38 +469,35 @@ fn spawn_connection_drain(
 ) {
     tokio::spawn(async move {
         let started = time::Instant::now();
+        let mut idle_since = None;
         loop {
             let active_stream_count = active_streams.load(Ordering::Relaxed);
-            if drain_should_close(active_stream_count, started.elapsed()) {
-                // A stream opened just before the relay swap but not yet accepted
-                // can be cancelled here.
-                connection.close(STREAM_CANCELLED, b"daemon certificate renewal");
-                if active_stream_count == 0 {
-                    info!(
-                        relay = %relay,
-                        drained_secs = started.elapsed().as_secs(),
-                        "drained superseded relay connection"
-                    );
-                } else {
-                    info!(
-                        relay = %relay,
-                        active_streams = active_stream_count,
-                        drain_grace_secs = DRAIN_GRACE.as_secs(),
-                        "closed superseded relay connection after drain grace"
-                    );
+            if active_stream_count == 0 {
+                let idle_started = *idle_since.get_or_insert_with(time::Instant::now);
+                if !drain_should_close(active_stream_count, idle_started.elapsed()) {
+                    time::sleep(DRAIN_POLL_INTERVAL).await;
+                    continue;
                 }
+                connection.close(STREAM_CANCELLED, b"daemon certificate renewal");
+                info!(
+                    relay = %relay,
+                    drained_secs = started.elapsed().as_secs(),
+                    idle_guard_secs = DRAIN_IDLE_GUARD.as_secs(),
+                    "drained superseded relay connection"
+                );
                 // The endpoint must live until drain completion or Quinn closes the connection.
                 drop(endpoint);
                 break;
             }
 
+            idle_since = None;
             time::sleep(DRAIN_POLL_INTERVAL).await;
         }
     });
 }
 
-fn drain_should_close(active_streams: usize, elapsed: Duration) -> bool {
-    active_streams == 0 || elapsed >= DRAIN_GRACE
+fn drain_should_close(active_streams: usize, idle_elapsed: Duration) -> bool {
+    active_streams == 0 && idle_elapsed >= DRAIN_IDLE_GUARD
 }
 
 async fn connect_once(
@@ -2274,10 +2271,14 @@ mod tests {
     }
 
     #[test]
-    fn drain_closes_when_idle_or_grace_expires() {
-        assert!(drain_should_close(0, Duration::ZERO));
-        assert!(!drain_should_close(1, DRAIN_GRACE - Duration::from_secs(1)));
-        assert!(drain_should_close(1, DRAIN_GRACE));
+    fn drain_closes_only_after_idle_guard() {
+        assert!(!drain_should_close(0, Duration::ZERO));
+        assert!(!drain_should_close(
+            0,
+            DRAIN_IDLE_GUARD - Duration::from_secs(1)
+        ));
+        assert!(drain_should_close(0, DRAIN_IDLE_GUARD));
+        assert!(!drain_should_close(1, Duration::from_secs(60 * 60)));
     }
 
     #[test]
