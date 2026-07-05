@@ -96,6 +96,15 @@ pub async fn load_tunnel_context(
     control: &ControlClient,
     ui: &UiState,
 ) -> Result<TunnelContext> {
+    load_tunnel_context_with_identity_refresh(cfg, control, ui, false).await
+}
+
+async fn load_tunnel_context_with_identity_refresh(
+    cfg: &Config,
+    control: &ControlClient,
+    ui: &UiState,
+    force_identity_refresh: bool,
+) -> Result<TunnelContext> {
     ensure_private_data_dir(&cfg.data_dir).await?;
 
     let trust = control.fetch_trust().await?;
@@ -111,7 +120,7 @@ pub async fn load_tunnel_context(
     );
     persist_device_state(cfg, &device, ui).await?;
 
-    let identity = ensure_identity(cfg, control, &device, &trust).await?;
+    let identity = ensure_identity(cfg, control, &device, &trust, force_identity_refresh).await?;
     Ok(TunnelContext { device, identity })
 }
 
@@ -131,6 +140,7 @@ async fn ensure_identity(
     control: &ControlClient,
     device: &DeviceConfig,
     trust: &TrustBundle,
+    force_refresh: bool,
 ) -> Result<TunnelIdentity> {
     ensure_private_data_dir(&cfg.data_dir).await?;
     let cert_path = cfg.data_dir.join(DEVICE_CERT_FILE);
@@ -142,16 +152,20 @@ async fn ensure_identity(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(err).context("read daemon certificate"),
     };
-    if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
-        if !certificate_needs_renewal(cert_pem, device) {
-            write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
-            write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
-            return Ok(TunnelIdentity {
-                ca_pem: trust.pem.clone(),
-                cert_pem: cert_pem.clone(),
-                key_pem: key_pem.clone(),
-            });
+    if !force_refresh {
+        if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
+            if !certificate_needs_renewal(cert_pem, device) {
+                write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
+                write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
+                return Ok(TunnelIdentity {
+                    ca_pem: trust.pem.clone(),
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                });
+            }
         }
+    } else if existing_cert.is_some() {
+        info!("cached daemon certificate was rejected; requesting replacement");
     }
 
     let key_pair = match existing_key {
@@ -185,13 +199,24 @@ pub async fn run(
         .build()
         .context("build PMS HTTP client")?;
     let mut attempt = 0_u32;
+    let mut force_identity_refresh = false;
 
     loop {
-        if certificate_needs_renewal(&context.identity.cert_pem, &context.device) {
-            match load_tunnel_context(&cfg, &control, &ui).await {
+        if force_identity_refresh
+            || certificate_needs_renewal(&context.identity.cert_pem, &context.device)
+        {
+            match load_tunnel_context_with_identity_refresh(
+                &cfg,
+                &control,
+                &ui,
+                force_identity_refresh,
+            )
+            .await
+            {
                 Ok(updated) => {
                     context = updated;
                     attempt = 0;
+                    force_identity_refresh = false;
                 }
                 Err(err) => {
                     ui.set_status(DaemonStatus::RelayUnreachable).await;
@@ -236,6 +261,17 @@ pub async fn run(
         {
             Ok(active) => active,
             Err(err) => {
+                if error_has_application_close(&err, STREAM_REVOKED) {
+                    ui.set_status(DaemonStatus::DeviceRevoked).await;
+                    warn!(
+                        error = %format!("{err:#}"),
+                        relay = %remote.addr,
+                        "relay rejected daemon certificate; refreshing identity"
+                    );
+                    force_identity_refresh = true;
+                    attempt = 0;
+                    continue;
+                }
                 ui.set_status(DaemonStatus::RelayUnreachable).await;
                 warn!(
                     error = %format!("{err:#}"),
@@ -306,7 +342,11 @@ pub async fn run(
                         Ok(status) => {
                             ui.set_status(status).await;
                             warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
-                            if terminal_close_status(status) {
+                            if status == DaemonStatus::DeviceRevoked {
+                                force_identity_refresh = true;
+                                attempt = 0;
+                                Duration::ZERO
+                            } else if terminal_close_status(status) {
                                 attempt = 0;
                                 Duration::from_secs(60)
                             } else {
@@ -590,6 +630,39 @@ fn terminal_close_status(status: DaemonStatus) -> bool {
         status,
         DaemonStatus::CapReached | DaemonStatus::DeviceRevoked
     )
+}
+
+fn error_has_application_close(error: &anyhow::Error, error_code: VarInt) -> bool {
+    error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<quinn::ConnectionError>() {
+            return connection_error_has_application_close(error, error_code);
+        }
+        if let Some(error) = cause.downcast_ref::<quinn::ReadError>() {
+            return read_error_has_application_close(error, error_code);
+        }
+        if let Some(error) = cause.downcast_ref::<quinn::ReadExactError>() {
+            return read_exact_error_has_application_close(error, error_code);
+        }
+        false
+    })
+}
+
+fn connection_error_has_application_close(
+    error: &quinn::ConnectionError,
+    error_code: VarInt,
+) -> bool {
+    matches!(error, quinn::ConnectionError::ApplicationClosed(close) if close.error_code == error_code)
+}
+
+fn read_error_has_application_close(error: &quinn::ReadError, error_code: VarInt) -> bool {
+    matches!(error, quinn::ReadError::ConnectionLost(error) if connection_error_has_application_close(error, error_code))
+}
+
+fn read_exact_error_has_application_close(
+    error: &quinn::ReadExactError,
+    error_code: VarInt,
+) -> bool {
+    matches!(error, quinn::ReadExactError::ReadError(error) if read_error_has_application_close(error, error_code))
 }
 
 async fn send_hello(connection: &Connection, device: &DeviceConfig) -> Result<()> {
@@ -2129,6 +2202,20 @@ mod tests {
         assert!(terminal_close_status(DaemonStatus::CapReached));
         assert!(terminal_close_status(DaemonStatus::DeviceRevoked));
         assert!(!terminal_close_status(DaemonStatus::Reconnecting));
+    }
+
+    #[test]
+    fn detects_revoked_application_close_in_read_errors() {
+        let close = quinn::ApplicationClose {
+            error_code: STREAM_REVOKED,
+            reason: Default::default(),
+        };
+        let error = anyhow::Error::new(quinn::ReadExactError::ReadError(
+            quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close)),
+        ));
+
+        assert!(error_has_application_close(&error, STREAM_REVOKED));
+        assert!(!error_has_application_close(&error, STREAM_QUOTA_EXCEEDED));
     }
 
     #[test]
