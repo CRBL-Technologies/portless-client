@@ -45,14 +45,24 @@ Open `http://127.0.0.1:43180/` for local daemon status.
 stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`; CI only
 updates the stack file and `PORTLESS_CLIENT_IMAGE`.
 
+Managed stacks run the daemon on Docker bridge networking and map
+`host.docker.internal` to the Docker host gateway. When Plex Media Server runs on
+the Docker host, use `PORTLESS_PMS_URL=http://host.docker.internal:32400` so
+Plex sees tunnel traffic as non-loopback traffic for its native bandwidth graph.
+
 Required stack environment:
 
 - `PORTLESS_DEVICE_TOKEN`
 - `PORTLESS_CONTROL_URL`
 - `PORTLESS_PMS_URL`
-- `PORTLESS_UI_ADDR`
 - `PORTLESS_CONTAINER_NAME`
 - `PORTLESS_CLIENT_IMAGE`
+
+Optional stack environment:
+
+- `PORTLESS_UI_ADDR` - container bind address, default `0.0.0.0:43180`.
+- `PORTLESS_UI_PUBLISH_ADDR` - host-side UI publish address, default
+  `127.0.0.1:43180`.
 
 The GitHub `staging` and `production` environments must provide:
 
