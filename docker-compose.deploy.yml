@@ -5,14 +5,17 @@ services:
     image: ${PORTLESS_CLIENT_IMAGE:?set PORTLESS_CLIENT_IMAGE in stack env}
     container_name: ${PORTLESS_CONTAINER_NAME:?set PORTLESS_CONTAINER_NAME in stack env}
     restart: "${PORTLESS_RESTART_POLICY:-unless-stopped}"
-    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PORTLESS_UI_PUBLISH_ADDR:-127.0.0.1:43180}:43180"
     environment:
       PORTLESS_DEVICE_TOKEN: ${PORTLESS_DEVICE_TOKEN:?set PORTLESS_DEVICE_TOKEN in stack env}
       PORTLESS_PMS_URL: ${PORTLESS_PMS_URL:?set PORTLESS_PMS_URL in stack env}
       PORTLESS_CONTROL_URL: ${PORTLESS_CONTROL_URL:?set PORTLESS_CONTROL_URL in stack env}
       PORTLESS_DATA_DIR: /var/lib/portless
       PORTLESS_KEEPALIVE_PROFILE: ${PORTLESS_KEEPALIVE_PROFILE:-residential}
-      PORTLESS_UI_ADDR: ${PORTLESS_UI_ADDR:?set PORTLESS_UI_ADDR in stack env}
+      PORTLESS_UI_ADDR: ${PORTLESS_UI_ADDR:-0.0.0.0:43180}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - portless-data:/var/lib/portless
