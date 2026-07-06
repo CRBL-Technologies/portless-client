@@ -99,7 +99,34 @@ deploy_stack() {
       'map(select(.name != $name)) + [{"name":$name,"value":$value}]')"
   }
 
+  migrate_bridge_network_env() {
+    local pms_url
+    pms_url="$(current_env_value PORTLESS_PMS_URL)"
+    case "$pms_url" in
+      http://127.0.0.1:32400|http://127.0.0.1:32400/|http://localhost:32400|http://localhost:32400/)
+        set_stack_env PORTLESS_PMS_URL "http://host.docker.internal:32400"
+        ;;
+    esac
+
+    local ui_addr ui_publish_addr
+    ui_addr="$(current_env_value PORTLESS_UI_ADDR)"
+    ui_publish_addr="$(current_env_value PORTLESS_UI_PUBLISH_ADDR)"
+    if [ -z "$ui_publish_addr" ] || [ "$ui_publish_addr" = "null" ] || [ "$ui_publish_addr" = "off" ]; then
+      if [ -n "$ui_addr" ] && [ "$ui_addr" != "null" ] && [ "$ui_addr" != "off" ]; then
+        ui_publish_addr="$ui_addr"
+      else
+        ui_publish_addr="127.0.0.1:43180"
+      fi
+      set_stack_env PORTLESS_UI_PUBLISH_ADDR "$ui_publish_addr"
+    fi
+
+    if [ "$ui_addr" != "off" ]; then
+      set_stack_env PORTLESS_UI_ADDR "0.0.0.0:43180"
+    fi
+  }
+
   set_stack_env PORTLESS_CLIENT_IMAGE "$client_image"
+  migrate_bridge_network_env
   if [ -n "${PORTLESS_CLIENT_CONTROL_URL:-}" ]; then
     set_stack_env PORTLESS_CONTROL_URL "$PORTLESS_CLIENT_CONTROL_URL"
   fi
