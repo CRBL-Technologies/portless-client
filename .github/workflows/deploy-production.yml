@@ -21,7 +21,7 @@ jobs:
       - name: Install 1Password CLI
         uses: 1password/install-cli-action@707af61a6c8b4fa7f9476328c035208fba6b54d7 # v2.0.0
         with:
-          version: latest-beta
+          version: 2.35.0
 
       - name: Deploy production stack
         env:
