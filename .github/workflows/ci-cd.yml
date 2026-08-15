@@ -229,6 +229,7 @@ jobs:
       always() &&
       github.event_name == 'push' &&
       github.ref_name == 'dev' &&
+      vars.STAGING_DEPLOYS_ENABLED != 'false' &&
       needs.test.result == 'success' &&
       needs.changes.outputs.deploy == 'true' &&
       (needs.docker.result == 'success' || needs.docker.result == 'skipped')
