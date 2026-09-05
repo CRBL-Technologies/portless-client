@@ -69,9 +69,7 @@ impl Config {
 
         let pms_url = parse_url("PORTLESS_PMS_URL", "http://plex:32400")?;
         let control_url = parse_url("PORTLESS_CONTROL_URL", "https://connect.portless.io")?;
-        let data_dir = PathBuf::from(
-            env::var("PORTLESS_DATA_DIR").unwrap_or_else(|_| "/var/lib/portless".to_owned()),
-        );
+        let data_dir = data_dir();
         let keepalive_profile = match env::var("PORTLESS_KEEPALIVE_PROFILE")
             .unwrap_or_else(|_| "residential".to_owned())
             .to_ascii_lowercase()
@@ -93,6 +91,10 @@ impl Config {
             ui_addr,
         })
     }
+}
+
+pub fn data_dir() -> PathBuf {
+    PathBuf::from(env::var("PORTLESS_DATA_DIR").unwrap_or_else(|_| "/var/lib/portless".to_owned()))
 }
 
 fn parse_url(key: &str, fallback: &str) -> Result<Url> {

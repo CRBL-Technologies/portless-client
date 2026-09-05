@@ -1,5 +1,7 @@
 mod config;
 mod control;
+#[cfg(unix)]
+mod health;
 mod state;
 mod tunnel;
 mod ui;
@@ -12,6 +14,16 @@ use ui::UiState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(command) = args.next() {
+        if command != "healthcheck" || args.next().is_some() {
+            anyhow::bail!("usage: portless-daemon [healthcheck]");
+        }
+        #[cfg(unix)]
+        return health::check(&config::data_dir()).await;
+        #[cfg(not(unix))]
+        anyhow::bail!("healthcheck requires Unix domain sockets");
+    }
     install_crypto_provider();
     tracing_subscriber::fmt()
         .json()
@@ -20,6 +32,8 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let ui_state = UiState::new(&cfg);
+    #[cfg(unix)]
+    let _health_server = health::start(&cfg.data_dir, ui_state.clone()).await?;
     if let Some(addr) = cfg.ui_addr {
         tokio::spawn(ui::serve(addr, ui_state.clone()));
     }
