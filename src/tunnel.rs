@@ -46,7 +46,7 @@ use x509_parser::prelude::*;
 use crate::{
     config::{Config, KeepaliveProfile},
     control::{CertificateResponse, ControlClient, DeviceConfig, TrustBundle},
-    state::DaemonState,
+    state::{write_private_file, DaemonState},
     ui::{DaemonStatus, UiState},
 };
 
@@ -66,6 +66,9 @@ const STREAM_REVOKED: VarInt = VarInt::from_u32(QuicApplicationErrorCode::Revoke
 const RENEWAL_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DRAIN_IDLE_GUARD: Duration = Duration::from_secs(5);
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// Match the relay's media leak guard, not a playback/read timeout. This starts
+// only after upstream EOF and all writes, and successful completion requires ACKs.
+const RESPONSE_DELIVERY_LEAK_GUARD: Duration = Duration::from_secs(4 * 60 * 60);
 const THROUGHPUT_METHOD: &str = "PORTLESS_BENCH";
 const THROUGHPUT_PATH: &str = "/_portless/throughput";
 const THROUGHPUT_BYTES_HEADER: &str = "x-portless-synthetic-bytes";
@@ -155,7 +158,9 @@ async fn ensure_identity(
     if !force_refresh {
         if let (Some(key_pem), Some(cert_pem)) = (&existing_key, &existing_cert) {
             if !certificate_needs_renewal(cert_pem, device) {
-                write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
+                if !fs::try_exists(cfg.data_dir.join(DEVICE_KEY_ENCRYPTED_FILE)).await? {
+                    write_encrypted_device_key(&cfg.data_dir, key_pem).await?;
+                }
                 write_private_file(&trust_path, trust.pem.as_bytes(), "trust bundle").await?;
                 return Ok(TunnelIdentity {
                     ca_pem: trust.pem.clone(),
@@ -290,7 +295,7 @@ pub async fn run(
         let mut endpoint = endpoint;
         let mut connection = connection;
         let mut session_started = time::Instant::now();
-        ui.set_status(DaemonStatus::Connected).await;
+        ui.set_connection(connection.clone()).await;
         let mut renewal_timer = Box::pin(time::sleep(certificate_renewal_delay(
             &context.identity.cert_pem,
             &context.device,
@@ -408,6 +413,7 @@ pub async fn run(
                                 ui.clone(),
                                 active_streams.clone(),
                             ));
+                            ui.set_connection(connection.clone()).await;
                             attempt = 0;
                             info!(
                                 old_relay = %old_remote,
@@ -511,6 +517,9 @@ fn spawn_connection_drain(
         let started = time::Instant::now();
         let mut idle_since = None;
         loop {
+            if connection.close_reason().is_some() {
+                break;
+            }
             let active_stream_count = active_streams.load(Ordering::Relaxed);
             if active_stream_count == 0 {
                 let idle_started = *idle_since.get_or_insert_with(time::Instant::now);
@@ -580,9 +589,13 @@ async fn serve_connection(
                 let pms_url = cfg.pms_url.clone();
                 let ui = ui.clone();
                 let active_streams = active_streams.clone();
+                let active_stream = ActiveForwardedStream::new(active_streams);
+                let connection = connection.clone();
                 tokio::spawn(async move {
-                    let _active_stream = ActiveForwardedStream::new(active_streams);
-                    if let Err(err) = forward_request(http, pms_url, send, recv, ui).await {
+                    let _active_stream = active_stream;
+                    if let Err(err) =
+                        forward_request(http, pms_url, connection, send, recv, ui).await
+                    {
                         warn!(error = %format!("{err:#}"), "forward QUIC request failed");
                     }
                 });
@@ -692,7 +705,45 @@ async fn send_hello(connection: &Connection, device: &DeviceConfig) -> Result<()
 async fn forward_request(
     http: Client,
     pms_url: Url,
-    send: SendStream,
+    connection: Connection,
+    mut send: SendStream,
+    recv: RecvStream,
+    ui: UiState,
+) -> Result<()> {
+    let stopped = send.stopped();
+    let cancelled = async {
+        match stopped.await {
+            // A half-closed upgrade may still be uploading after its response is ACKed.
+            Ok(None) => std::future::pending().await,
+            result => result,
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        error = connection.closed() => Err(anyhow!("relay connection closed: {error}")),
+        result = cancelled => Err(anyhow!("relay stopped response stream: {result:?}")),
+        result = forward_request_inner(http, pms_url, &mut send, recv, ui) => result,
+    };
+    if let Err(err) = result {
+        let _ = send.reset(STREAM_CANCELLED);
+        return Err(err);
+    }
+
+    // finish() only queues FIN. Keep the active-stream guard until delivery,
+    // downstream cancellation, connection loss, or the existing leak-guard bound.
+    match time::timeout(RESPONSE_DELIVERY_LEAK_GUARD, send.stopped()).await {
+        Ok(Ok(None)) => Ok(()),
+        result => {
+            let _ = send.reset(STREAM_CANCELLED);
+            bail!("response delivery did not complete: {result:?}")
+        }
+    }
+}
+
+async fn forward_request_inner(
+    http: Client,
+    pms_url: Url,
+    send: &mut SendStream,
     mut recv: RecvStream,
     ui: UiState,
 ) -> Result<()> {
@@ -707,8 +758,7 @@ async fn forward_request(
         return forward_upgrade_request(http, pms_url, request, send, recv, started, ui).await;
     }
 
-    let body = quic_request_body(recv);
-    let mut send = send;
+    let (body, _cancel_upload) = quic_request_body(recv);
     match send_local_request(&http, &pms_url, &request, body).await {
         Ok(response) => {
             ui.set_status(DaemonStatus::Connected).await;
@@ -718,7 +768,7 @@ async fn forward_request(
                 request.method,
                 request.path_query,
                 response,
-                &mut send,
+                send,
                 false,
                 started,
                 rewrite.as_ref(),
@@ -744,7 +794,7 @@ async fn forward_request(
                 started,
                 outcome: "pms_request_failed",
             });
-            send_error_response(request.id, err, &mut send).await
+            send_error_response(request.id, err, send).await
         }
     }
 }
@@ -753,7 +803,7 @@ async fn forward_upgrade_request(
     http: Client,
     pms_url: Url,
     request: TunnelRequest,
-    mut send: SendStream,
+    send: &mut SendStream,
     recv: RecvStream,
     started: time::Instant,
     ui: UiState,
@@ -772,7 +822,7 @@ async fn forward_upgrade_request(
                 request.method,
                 request.path_query,
                 response,
-                &mut send,
+                send,
                 false,
                 started,
                 rewrite.as_ref(),
@@ -798,7 +848,7 @@ async fn forward_upgrade_request(
                 started,
                 outcome: "pms_upgrade_request_failed",
             });
-            send_error_response(request.id, err, &mut send).await
+            send_error_response(request.id, err, send).await
         }
     }
 }
@@ -837,7 +887,7 @@ fn synthetic_header<'a>(request: &'a TunnelRequest, name: &str) -> Option<&'a st
 
 async fn stream_synthetic_response(
     request: TunnelRequest,
-    mut send: SendStream,
+    send: &mut SendStream,
     started: time::Instant,
     config: SyntheticBenchmarkConfig,
 ) -> Result<()> {
@@ -862,7 +912,7 @@ async fn stream_synthetic_response(
             },
         ],
     };
-    if let Err(err) = write_json_frame(&mut send, &head).await {
+    if let Err(err) = write_json_frame(send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
             request_id: &request_id,
             method: &method,
@@ -986,38 +1036,49 @@ async fn send_local_upgrade_request(
         .context("send local PMS upgrade request")
 }
 
-fn quic_request_body(mut recv: RecvStream) -> reqwest::Body {
+fn quic_request_body(mut recv: RecvStream) -> (reqwest::Body, tokio::sync::oneshot::Sender<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(64);
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let mut total = 0_u64;
-        let mut buf = vec![0_u8; 64 * 1024];
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(Some(read)) => {
-                    total = total.saturating_add(read as u64);
-                    if total > MAX_REQUEST_BODY {
-                        let err = io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "request body exceeds daemon limit",
-                        );
+        let pump = async {
+            let mut total = 0_u64;
+            let mut buf = vec![0_u8; 64 * 1024];
+            loop {
+                match recv.read(&mut buf).await {
+                    Ok(Some(read)) => {
+                        total = total.saturating_add(read as u64);
+                        if total > MAX_REQUEST_BODY {
+                            let err = io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "request body exceeds daemon limit",
+                            );
+                            let _ = tx.send(Err(err)).await;
+                            break;
+                        }
+                        if tx.send(Ok(buf[..read].to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let err = io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string());
                         let _ = tx.send(Err(err)).await;
                         break;
                     }
-                    if tx.send(Ok(buf[..read].to_vec())).await.is_err() {
-                        let _ = recv.stop(STREAM_CANCELLED);
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    let err = io::Error::new(io::ErrorKind::ConnectionAborted, err.to_string());
-                    let _ = tx.send(Err(err)).await;
-                    break;
                 }
             }
+        };
+        tokio::select! {
+            _ = cancelled => {},
+            _ = tx.closed() => {},
+            _ = pump => {},
         }
+        let _ = recv.stop(STREAM_CANCELLED);
     });
-    reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+    (
+        reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        cancel,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,7 +1093,9 @@ async fn stream_local_response(
     rewrite: Option<&RedirectRewrite>,
 ) -> Result<()> {
     let status = response.status().as_u16();
-    let preserve_content_length = should_preserve_response_content_length(&method, &path_query);
+    let response_is_range = status == 206 && response.headers().contains_key(header::CONTENT_RANGE);
+    let preserve_content_length =
+        should_preserve_response_content_length(&method, &path_query) || response_is_range;
     let head = TunnelResponseHead {
         id: request_id.clone(),
         status,
@@ -1143,7 +1206,7 @@ async fn stream_local_upgrade_response(
     request_id: String,
     method: String,
     response: reqwest::Response,
-    mut send: SendStream,
+    send: &mut SendStream,
     recv: RecvStream,
     started: time::Instant,
 ) -> Result<()> {
@@ -1153,7 +1216,7 @@ async fn stream_local_upgrade_response(
         status,
         headers: serializable_response_headers(response.headers(), true, None, false),
     };
-    if let Err(err) = write_json_frame(&mut send, &head).await {
+    if let Err(err) = write_json_frame(send, &head).await {
         log_daemon_transfer(DaemonTransferLog {
             request_id: &request_id,
             method: &method,
@@ -1191,9 +1254,31 @@ async fn stream_local_upgrade_response(
     let mut relay_recv = recv;
 
     let relay_to_pms = async {
-        let copied = tokio_io::copy(&mut relay_recv, &mut pms_write)
+        let mut copied = 0_u64;
+        let mut buf = [0_u8; 8 * 1024];
+        while let Some(read) = relay_recv
+            .read(&mut buf)
             .await
-            .context("copy upgraded QUIC bytes to PMS")?;
+            .context("read upgraded QUIC bytes")?
+        {
+            // A blocked PMS write must still observe a request-stream reset.
+            let reset = async {
+                match relay_recv.received_reset().await {
+                    Ok(None) => std::future::pending().await,
+                    result => result,
+                }
+            };
+            tokio::select! {
+                biased;
+                result = reset => bail!("upgraded request stream reset: {result:?}"),
+                result = pms_write.write_all(&buf[..read]) => result.context("write upgraded PMS bytes")?,
+            }
+            copied += read as u64;
+        }
+        pms_write
+            .flush()
+            .await
+            .context("flush upgraded PMS write")?;
         pms_write
             .shutdown()
             .await
@@ -1574,6 +1659,7 @@ fn is_plex_media_response_path(path_query: &str) -> bool {
         .collect();
     match segments.as_slice() {
         ["downloadQueue", _, "item", _, "media"] => true,
+        ["library", "parts", _, _, file] => file.starts_with("file."),
         [kind, ":", "transcode", .., file] if is_transcode_kind(kind) => {
             is_plex_transcode_media_file(file)
         }
@@ -1679,7 +1765,7 @@ fn parse_private_key_pem(raw: &str) -> Result<PrivateKeyDer<'static>> {
     PrivateKeyDer::from_pem_slice(raw.as_bytes()).context("parse private key PEM")
 }
 
-async fn ensure_private_data_dir(data_dir: &Path) -> Result<()> {
+pub(crate) async fn ensure_private_data_dir(data_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)
         .await
         .context("create daemon data dir")?;
@@ -1703,13 +1789,6 @@ async fn repair_identity_permissions(data_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-async fn write_private_file(path: &Path, contents: impl AsRef<[u8]>, label: &str) -> Result<()> {
-    fs::write(path, contents)
-        .await
-        .with_context(|| format!("write {label}"))?;
-    restrict_file_permissions(path, label).await
 }
 
 async fn restrict_data_dir_permissions(data_dir: &Path) -> Result<()> {
@@ -1747,7 +1826,11 @@ async fn read_device_key(data_dir: &Path) -> Result<Option<String>> {
 
     let encrypted_path = data_dir.join(DEVICE_KEY_ENCRYPTED_FILE);
     match fs::read_to_string(&encrypted_path).await {
-        Ok(raw) => return decrypt_device_key(data_dir, &raw).await.map(Some),
+        Ok(raw) => {
+            let key = decrypt_device_key(data_dir, &raw).await?;
+            remove_plaintext_device_key(data_dir).await?;
+            return Ok(Some(key));
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).context("read encrypted daemon key"),
     }
@@ -1794,6 +1877,10 @@ async fn write_encrypted_device_key(data_dir: &Path, key_pem: &str) -> Result<()
         "encrypted daemon key",
     )
     .await?;
+    remove_plaintext_device_key(data_dir).await
+}
+
+async fn remove_plaintext_device_key(data_dir: &Path) -> Result<()> {
     match fs::remove_file(data_dir.join(DEVICE_KEY_PLAINTEXT_FILE)).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -2323,6 +2410,28 @@ mod tests {
             "GET",
             "/downloadQueue/2/item/75/media?token=redacted"
         ));
+        for path in [
+            "/library/parts/7490/1725460000/file.mp4",
+            "/library/parts/7490/1725460000/file.mkv?download=1",
+        ] {
+            assert!(should_preserve_response_content_length("GET", path));
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_LENGTH, "1024".parse().unwrap());
+            headers.insert(header::CONTENT_RANGE, "bytes 0-1023/4096".parse().unwrap());
+            let got = serializable_response_headers(
+                &headers,
+                false,
+                None,
+                should_preserve_response_content_length("GET", path),
+            );
+            assert!(got
+                .iter()
+                .any(|header| header.name == "content-length" && header.value == "1024"));
+            assert!(got.iter().any(
+                |header| header.name == "content-range" && header.value == "bytes 0-1023/4096"
+            ));
+            assert!(!should_preserve_response_content_length("POST", path));
+        }
     }
 
     #[test]
@@ -2366,6 +2475,17 @@ mod tests {
         ));
         assert!(drain_should_close(0, DRAIN_IDLE_GUARD));
         assert!(!drain_should_close(1, Duration::from_secs(60 * 60)));
+        let active = Arc::new(AtomicUsize::new(0));
+        let guard = ActiveForwardedStream::new(active.clone());
+        assert!(!drain_should_close(
+            active.load(Ordering::Relaxed),
+            DRAIN_IDLE_GUARD
+        ));
+        drop(guard);
+        assert!(drain_should_close(
+            active.load(Ordering::Relaxed),
+            DRAIN_IDLE_GUARD
+        ));
     }
 
     #[test]
@@ -2457,6 +2577,82 @@ mod tests {
         assert_eq!(
             read_device_key(&dir).await.unwrap().unwrap(),
             "test-private-key"
+        );
+
+        let encrypted_path = dir.join(DEVICE_KEY_ENCRYPTED_FILE);
+        let mut old_file = fs::File::open(&encrypted_path).await.unwrap();
+        let original = fs::read(&encrypted_path).await.unwrap();
+        write_encrypted_device_key(&dir, "replacement-test-key")
+            .await
+            .unwrap();
+        let mut old_contents = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut old_file, &mut old_contents)
+            .await
+            .unwrap();
+        assert_eq!(
+            old_contents, original,
+            "replacement must not truncate the old inode"
+        );
+        assert_eq!(
+            read_device_key(&dir).await.unwrap().unwrap(),
+            "replacement-test-key"
+        );
+        assert_private_path_mode(&encrypted_path, 0o600).await;
+
+        let cfg = Config {
+            pms_url: Url::parse("http://127.0.0.1:1").unwrap(),
+            control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+            device_token: "test-token".to_owned(),
+            data_dir: dir.clone(),
+            keepalive_profile: KeepaliveProfile::Residential,
+            ui_addr: None,
+        };
+        let control = ControlClient::new(cfg.control_url.clone(), cfg.device_token.clone());
+        let device = test_device_config("tun_abc", "sample");
+        fs::write(
+            dir.join(DEVICE_CERT_FILE),
+            test_device_certificate("tun_abc", "sample"),
+        )
+        .await
+        .unwrap();
+        let trust = TrustBundle {
+            pem: "test-trust".to_owned(),
+            generated_at: "test".to_owned(),
+        };
+        let original = fs::read(&encrypted_path).await.unwrap();
+        let plaintext_path = dir.join(DEVICE_KEY_PLAINTEXT_FILE);
+        fs::write(&plaintext_path, "replacement-test-key")
+            .await
+            .unwrap();
+        let identity = ensure_identity(&cfg, &control, &device, &trust, false)
+            .await
+            .unwrap();
+        assert_eq!(identity.key_pem, "replacement-test-key");
+        assert_eq!(
+            fs::read(&encrypted_path).await.unwrap(),
+            original,
+            "valid cached identity must not be rewritten"
+        );
+        assert!(
+            !fs::try_exists(&plaintext_path).await.unwrap(),
+            "finish an interrupted plaintext migration"
+        );
+
+        fs::write(&plaintext_path, "replacement-test-key")
+            .await
+            .unwrap();
+        fs::write(&encrypted_path, "{invalid").await.unwrap();
+        assert!(
+            ensure_identity(&cfg, &control, &device, &trust, false)
+                .await
+                .is_err(),
+            "damaged identity must not be silently regenerated"
+        );
+        assert_eq!(fs::read(&encrypted_path).await.unwrap(), b"{invalid");
+        assert_eq!(
+            fs::read(&plaintext_path).await.unwrap(),
+            b"replacement-test-key",
+            "failed encrypted load must preserve the legacy key"
         );
 
         fs::remove_dir_all(&dir).await.unwrap();
@@ -2579,12 +2775,345 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn downstream_cancel_releases_stalled_pms_and_upload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (upgrade, response_head) in [
+            (false, ""),
+            (false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"),
+            (true, ""),
+            (true, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buf[..read]);
+                }
+                socket.write_all(response_head.as_bytes()).await.unwrap();
+                ready_tx.send(()).unwrap();
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => {},
+                        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => break,
+                        Err(err) => panic!("PMS socket: {err}"),
+                    }
+                }
+            });
+            let cfg = Config {
+                pms_url: Url::parse(&format!("http://{addr}")).unwrap(),
+                control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+                device_token: "test-token".to_owned(),
+                data_dir: std::env::temp_dir(),
+                keepalive_profile: KeepaliveProfile::Residential,
+                ui_addr: None,
+            };
+            let (daemon, relay, _client, _server) = local_quic_pair().await;
+            let (mut upload, mut download) = relay.open_bi().await.unwrap();
+            write_json_frame(&mut upload, &TunnelRequest {
+                id: "cancel-test".to_owned(),
+                method: if upgrade { "GET" } else { "POST" }.to_owned(),
+                path_query: "/test".to_owned(),
+                headers: vec![],
+                upgrade: upgrade.then(|| "websocket".to_owned()),
+            }).await.unwrap();
+            // Keep the upload open so cancellation must also stop its blocked pump.
+            upload.write_all(b"x").await.unwrap();
+            let (send, recv) = daemon.accept_bi().await.unwrap();
+            let active = Arc::new(AtomicUsize::new(0));
+            let guard = ActiveForwardedStream::new(active.clone());
+            let connection = daemon.clone();
+            let mut forwarding = tokio::spawn(async move {
+                let _guard = guard;
+                forward_request(Client::new(), cfg.pms_url.clone(), connection, send, recv, UiState::new(&cfg)).await
+            });
+            time::timeout(Duration::from_secs(2), ready_rx).await.unwrap().unwrap();
+            if !response_head.is_empty() {
+                let _: TunnelResponseHead = time::timeout(Duration::from_secs(2), read_json_frame(&mut download)).await.unwrap().unwrap();
+            }
+            assert!(time::timeout(Duration::from_millis(100), &mut forwarding).await.is_err(),
+                "a stalled but connected consumer must stay active");
+            assert_eq!(active.load(Ordering::Relaxed), 1);
+            download.stop(STREAM_CANCELLED).unwrap();
+            let result = time::timeout(Duration::from_secs(2), forwarding).await.unwrap().unwrap();
+            assert!(result.is_err());
+            assert_eq!(active.load(Ordering::Relaxed), 0);
+            let upload_stop = time::timeout(Duration::from_secs(2), upload.stopped()).await.unwrap().unwrap();
+            if upgrade {
+                // Dropping an upgraded receive stream uses Quinn's default stop code.
+                assert!(upload_stop.is_some());
+            } else {
+                assert_eq!(upload_stop, Some(STREAM_CANCELLED));
+            }
+            time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        }
+    }
+
     #[test]
     fn parses_plain_relay_endpoint_with_default_port() {
         let (host, port) = parse_relay_endpoint("relay-ams-1.portless.io").unwrap();
 
         assert_eq!(host, "relay-ams-1.portless.io");
         assert_eq!(port, 443);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthcheck_uses_live_connection_with_ui_disabled() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("portless-health-test-{nonce}"));
+        fs::create_dir_all(&dir).await.unwrap();
+        let socket = dir.join("health.sock");
+        drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        let cfg = Config {
+            pms_url: Url::parse("http://127.0.0.1:1").unwrap(),
+            control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+            device_token: "test-token".to_owned(),
+            data_dir: dir.clone(),
+            keepalive_profile: KeepaliveProfile::Residential,
+            ui_addr: None,
+        };
+        let state = UiState::new(&cfg);
+        let server = crate::health::start(&dir, state.clone()).await.unwrap();
+        assert_private_path_mode(&dir, 0o700).await;
+        assert_private_path_mode(&socket, 0o600).await;
+        assert!(
+            crate::health::start(&dir, state.clone()).await.is_err(),
+            "must not replace a live socket"
+        );
+        assert!(
+            crate::health::check(&dir).await.is_err(),
+            "startup is unhealthy"
+        );
+        state.set_status(DaemonStatus::Connected).await;
+        assert!(
+            crate::health::check(&dir).await.is_err(),
+            "a status without a live connection is insufficient"
+        );
+        let (daemon, relay, _client, _server) = local_quic_pair().await;
+        state.set_connection(daemon.clone()).await;
+        crate::health::check(&dir).await.unwrap();
+        state.set_status(DaemonStatus::Reconnecting).await;
+        assert!(crate::health::check(&dir).await.is_err());
+        state.set_connection(daemon.clone()).await;
+        relay.close(STREAM_CANCELLED, b"test disconnect");
+        time::timeout(Duration::from_secs(2), daemon.closed())
+            .await
+            .unwrap();
+        assert!(
+            crate::health::check(&dir).await.is_err(),
+            "closed transport must override stale connected status"
+        );
+        drop(server);
+        assert!(!socket.exists());
+        assert!(crate::health::check(&dir).await.is_err());
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_media_and_half_closed_upgrade_finish_normally() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (upgrade, method, path, close_connection) in [
+            (
+                false,
+                "GET",
+                "/library/parts/7490/1725460000/file.mp4?download=1",
+                None,
+            ),
+            (false, "GET", "/unclassified-range", None),
+            (false, "HEAD", "/identity", None),
+            (true, "GET", "/test-upgrade", None),
+            (true, "GET", "/test-upgrade", Some(true)),
+            (true, "GET", "/test-upgrade", Some(false)),
+        ] {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(1024).unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = socket.listen(1).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (allow_read, wait_for_cancel) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                if upgrade {
+                    socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nhello").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    if close_connection.is_some() {
+                        wait_for_cancel.await.unwrap();
+                    }
+                    let mut late_upload = Vec::new();
+                    let result = socket.read_to_end(&mut late_upload).await;
+                    if close_connection.is_some() {
+                        if let Err(err) = result {
+                            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+                        }
+                        assert!(!late_upload.is_empty());
+                    } else {
+                        result.unwrap();
+                        assert_eq!(late_upload, b"late upload");
+                    }
+                } else if method == "HEAD" {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/20\r\n\r\nhello").await.unwrap();
+                }
+            });
+            let cfg = Config {
+                pms_url: Url::parse(&format!("http://{addr}")).unwrap(),
+                control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+                device_token: "test-token".to_owned(),
+                data_dir: std::env::temp_dir(),
+                keepalive_profile: KeepaliveProfile::Residential,
+                ui_addr: None,
+            };
+            let (daemon, relay, _client, _server) = local_quic_pair().await;
+            let (mut upload, mut download) = relay.open_bi().await.unwrap();
+            write_json_frame(
+                &mut upload,
+                &TunnelRequest {
+                    id: "normal-completion-test".to_owned(),
+                    method: method.to_owned(),
+                    path_query: path.to_owned(),
+                    headers: vec![],
+                    upgrade: upgrade.then(|| "websocket".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+            if !upgrade {
+                upload.finish().unwrap();
+            }
+            let (send, recv) = daemon.accept_bi().await.unwrap();
+            let delivered = send.stopped();
+            let active = Arc::new(AtomicUsize::new(0));
+            let guard = ActiveForwardedStream::new(active.clone());
+            let connection = daemon.clone();
+            let mut forwarding = tokio::spawn(async move {
+                let _guard = guard;
+                forward_request(
+                    Client::new(),
+                    cfg.pms_url.clone(),
+                    connection,
+                    send,
+                    recv,
+                    UiState::new(&cfg),
+                )
+                .await
+            });
+            let head: TunnelResponseHead =
+                time::timeout(Duration::from_secs(2), read_json_frame(&mut download))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                head.status,
+                if upgrade {
+                    101
+                } else if method == "HEAD" {
+                    200
+                } else {
+                    206
+                }
+            );
+            if !upgrade {
+                assert!(head
+                    .headers
+                    .iter()
+                    .any(|h| h.name == "content-length" && h.value == "5"));
+                if method != "HEAD" {
+                    assert!(head
+                        .headers
+                        .iter()
+                        .any(|h| h.name == "content-range" && h.value == "bytes 5-9/20"));
+                }
+            }
+            assert_eq!(
+                time::timeout(Duration::from_secs(2), download.read_to_end(1024))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                if method == "HEAD" {
+                    b"".as_slice()
+                } else {
+                    b"hello".as_slice()
+                }
+            );
+            if upgrade {
+                assert_eq!(
+                    time::timeout(Duration::from_secs(2), delivered)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    None
+                );
+                assert!(
+                    time::timeout(Duration::from_millis(100), &mut forwarding)
+                        .await
+                        .is_err(),
+                    "response ACK must not cancel a half-closed upgrade upload"
+                );
+                if let Some(close_connection) = close_connection {
+                    let bytes = vec![0_u8; 8 * 1024 * 1024];
+                    assert!(
+                        time::timeout(Duration::from_millis(200), upload.write_all(&bytes))
+                            .await
+                            .is_err(),
+                        "PMS must apply backpressure before cancellation"
+                    );
+                    assert!(!forwarding.is_finished());
+                    assert_eq!(active.load(Ordering::Relaxed), 1);
+                    if close_connection {
+                        relay.close(STREAM_CANCELLED, b"cancel blocked upload");
+                    } else {
+                        upload.reset(STREAM_CANCELLED).unwrap();
+                    }
+                    let result = time::timeout(Duration::from_secs(2), forwarding)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(result.is_err());
+                    assert_eq!(active.load(Ordering::Relaxed), 0);
+                    if !close_connection {
+                        assert!(relay.close_reason().is_none());
+                    }
+                    allow_read.send(()).unwrap();
+                    time::timeout(Duration::from_secs(2), server)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    continue;
+                }
+                upload.write_all(b"late upload").await.unwrap();
+                upload.finish().unwrap();
+            }
+            time::timeout(Duration::from_secs(2), forwarding)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]
