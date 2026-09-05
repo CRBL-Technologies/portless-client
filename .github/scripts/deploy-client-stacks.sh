@@ -61,6 +61,8 @@ deploy_stack() {
   fi
 
   local stack_endpoint_id
+  local stack_name
+  stack_name="$(echo "$stack_resp" | jq -er '.Name')"
   stack_endpoint_id="$(echo "$stack_resp" | jq -r '.EndpointId // empty')"
   if [ -z "$stack_endpoint_id" ]; then
     stack_endpoint_id="$endpoint_id_fallback"
@@ -131,11 +133,28 @@ deploy_stack() {
     set_stack_env PORTLESS_CONTROL_URL "$PORTLESS_CLIENT_CONTROL_URL"
   fi
 
-  local env_file payload_file update_response_file
+  local env_file payload_file
   env_file="$(mktemp)"
   payload_file="$(mktemp)"
-  update_response_file="$(mktemp)"
   printf '%s' "$env_json" > "$env_file"
+  local expected_config_hash
+  expected_config_hash="$(python3 - "$env_file" "$stack_name" <<'PY'
+import json, os, subprocess, sys
+try:
+    with open(sys.argv[1]) as source:
+        values = json.load(source)
+    env = {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
+    env.update({entry["name"]: entry["value"] or "" for entry in values})
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", "/dev/null", "--project-name", sys.argv[2],
+         "-f", "docker-compose.deploy.yml", "config", "--hash", "portless-daemon"],
+        env=env, text=True, capture_output=True, check=True,
+    )
+    print(dict(line.split() for line in result.stdout.splitlines())["portless-daemon"])
+except Exception:
+    sys.exit("Could not calculate the intended client configuration; deployment aborted")
+PY
+  )"
   jq -n --arg file "$stack_file" --slurpfile env "$env_file" \
     '{stackFileContent: $file, env: $env[0], pullImage: true}' > "$payload_file"
 
@@ -144,6 +163,8 @@ deploy_stack() {
     local repo="${image%:*}"
     local tag="${image##*:}"
     local registry_auth
+    local pull_response
+    pull_response="$(mktemp)"
     registry_auth="$(jq -nc \
       --arg username "$GHCR_USERNAME" \
       --arg password "$GHCR_TOKEN" \
@@ -151,8 +172,14 @@ deploy_stack() {
     curl -sf --max-time 300 -X POST \
       "${auth_headers[@]}" \
       -H "X-Registry-Auth: ${registry_auth}" \
-      -o /tmp/portless-image-pull.log \
+      -o "$pull_response" \
       "$api/endpoints/${stack_endpoint_id}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
+    if ! jq -se 'length > 0 and all(.[]; .error == null and .errorDetail == null)' "$pull_response" >/dev/null; then
+      rm -f "$pull_response"
+      echo "::error title=Image pull failed::Registry did not confirm the requested client image" >&2
+      return 1
+    fi
+    rm -f "$pull_response"
   }
 
   local endpoint_ready=0
@@ -172,14 +199,20 @@ deploy_stack() {
     exit 1
   fi
 
-  if [ "${DAEMON_CHANGED}" = "true" ]; then
-    pull_image "$client_image"
+  pull_image "$client_image"
+  local expected_image_id image_json
+  image_json="$(curl -sf --max-time 30 "${auth_headers[@]}" \
+    "$api/endpoints/$stack_endpoint_id/docker/images/$(urlencode "$client_image")/json")"
+  if ! jq -e '.Config.Healthcheck.Test == ["CMD", "/usr/local/bin/portless-daemon", "healthcheck"]' <<< "$image_json" >/dev/null; then
+    echo "::error title=Client image upgrade required::Select a healthcheck-enabled client image before updating this stack" >&2
+    exit 1
   fi
+  expected_image_id="$(jq -er '.Id' <<< "$image_json")"
 
   if ! curl -sf --max-time 180 -X PUT \
     "${auth_headers[@]}" \
     -H "Content-Type: application/json" \
-    -o "$update_response_file" \
+    -o /dev/null \
     -d @"$payload_file" \
     "$api/stacks/${stack_id}?endpointId=${stack_endpoint_id}"; then
     echo "::error title=Deploy stack update failed::${target_name} stack ${stack_id} update failed"
@@ -201,11 +234,34 @@ deploy_stack() {
     sleep 3
   done
   if [ "$verified" -ne 1 ]; then
-    echo "::warning title=Deploy verification delayed::${target_name} stored stack file did not match repository compose file within the verification window"
+    echo "::error title=Deploy verification failed::${target_name} stored stack file did not match repository compose file within the verification window"
+    exit 1
+  fi
+
+  local container_name container_json
+  container_name="$(current_env_value PORTLESS_CONTAINER_NAME)"
+  verified=0
+  for i in {1..36}; do
+    if container_json="$(curl -sf --max-time 30 "${auth_headers[@]}" \
+      "$api/endpoints/$stack_endpoint_id/docker/containers/$(urlencode "$container_name")/json")" &&
+      jq -e --arg image "$client_image" --arg image_id "$expected_image_id" --arg config_hash "$expected_config_hash" '
+        .Config.Image == $image and .Image == $image_id and .State.Running == true and
+        .Config.Labels["com.docker.compose.config-hash"] == $config_hash and
+        .State.Paused == false and .State.Restarting == false and
+        .State.Health.Status == "healthy"
+      ' <<< "$container_json" >/dev/null; then
+      verified=1
+      break
+    fi
+    [ "$i" -eq 36 ] || sleep 5
+  done
+  if [ "$verified" -ne 1 ]; then
+    echo "::error title=Deploy verification failed::${target_name} client did not become healthy with the requested image"
+    exit 1
   fi
 
   echo "Deployed ${target_name} stack ${stack_id} on endpoint ${stack_endpoint_id} with image ${client_image}"
-  rm -f "$env_file" "$payload_file" "$update_response_file"
+  rm -f "$env_file" "$payload_file"
 }
 
 if [ "$deploy_primary_staging" -eq 1 ]; then

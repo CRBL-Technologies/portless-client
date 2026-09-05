@@ -18,4 +18,5 @@ RUN useradd --system --uid 10001 --home /var/lib/portless portless \
 
 USER portless
 COPY --from=build /src/target/release/portless-daemon /usr/local/bin/portless-daemon
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 CMD ["/usr/local/bin/portless-daemon", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/portless-daemon"]
