@@ -2,6 +2,11 @@ name: Deploy Production Client
 
 on:
   workflow_dispatch:
+    inputs:
+      client_image:
+        description: 'Published healthcheck-enabled image: ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -34,9 +39,7 @@ jobs:
           PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID: ${{ vars.PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
-          DAEMON_CHANGED: "false"
-          DEPLOY_CONFIG_CHANGED: "false"
-          PORTLESS_CLIENT_USE_DEFAULT_IMAGE: "true"
+          PORTLESS_CLIENT_DEPLOY_IMAGE: ${{ inputs.client_image }}
         run: |
           set -euo pipefail
           if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then

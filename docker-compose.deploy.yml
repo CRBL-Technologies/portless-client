@@ -5,6 +5,10 @@ services:
     image: ${PORTLESS_CLIENT_IMAGE:?set PORTLESS_CLIENT_IMAGE in stack env}
     container_name: ${PORTLESS_CONTAINER_NAME:?set PORTLESS_CONTAINER_NAME in stack env}
     restart: "${PORTLESS_RESTART_POLICY:-unless-stopped}"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

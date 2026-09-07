@@ -199,10 +199,7 @@ pub async fn run(
     mut context: TunnelContext,
     ui: UiState,
 ) -> Result<()> {
-    let http = Client::builder()
-        .redirect(Policy::none())
-        .build()
-        .context("build PMS HTTP client")?;
+    let http = pms_http_client()?;
     let mut attempt = 0_u32;
     let mut force_identity_refresh = false;
 
@@ -750,6 +747,9 @@ async fn forward_request_inner(
     let request: TunnelRequest = read_json_frame(&mut recv)
         .await
         .context("read relay request head")?;
+    if request.method.eq_ignore_ascii_case("CONNECT") {
+        bail!("HTTP CONNECT is not supported");
+    }
     let started = time::Instant::now();
     if let Some(config) = synthetic_benchmark_config(&request)? {
         return stream_synthetic_response(request, send, started, config).await;
@@ -981,6 +981,14 @@ async fn stream_synthetic_response(
         outcome: "ok",
     });
     Ok(())
+}
+
+fn pms_http_client() -> Result<Client> {
+    Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .build()
+        .context("build PMS HTTP client")
 }
 
 async fn send_local_request(
@@ -2220,6 +2228,21 @@ mod tests {
             got.as_str(),
             "http://127.0.0.1:32400/video/:/transcode/universal/start.m3u8?X-Plex-Token=abc"
         );
+
+        for path in [
+            "http://192.0.2.10:8080/admin",
+            "//192.0.2.10:8080/admin",
+            r"/\192.0.2.10:8080/admin",
+            r"\\192.0.2.10:8080/admin",
+            "/%2f%2f192.0.2.10:8080/admin",
+            "/%5c%5c192.0.2.10:8080/admin",
+            "/../admin?url=http://192.0.2.10:8080/",
+            "//user@192.0.2.10:8080/admin",
+            "//[2001:db8::10]:8080/admin",
+        ] {
+            let target = pms_target_url(&pms_url, path).unwrap();
+            assert!(same_url_origin(&target, &pms_url), "{path}: {target}");
+        }
     }
 
     #[test]
@@ -2732,6 +2755,128 @@ mod tests {
             // Drop the socket without the terminating chunk: a truncated body.
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn pms_forwarding_stays_on_configured_endpoint() {
+        use tokio::io::AsyncReadExt;
+
+        let forbidden = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forbidden_addr = forbidden.local_addr().unwrap();
+        for path in [
+            "/library/sections".to_owned(),
+            format!("http://{forbidden_addr}/admin"),
+            format!("//{forbidden_addr}/admin"),
+            format!(r"/\{forbidden_addr}/admin"),
+        ] {
+            for upgrade in [false, true] {
+                let pms = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let pms_url = Url::parse(&format!("http://{}", pms.local_addr().unwrap())).unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = pms.accept().await.unwrap();
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        head.push(socket.read_u8().await.unwrap());
+                        assert!(head.len() < 8192);
+                    }
+                    assert!(head.starts_with(b"GET /"));
+                    let response = if upgrade {
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nplex-upgrade".to_owned()
+                    } else {
+                        format!("HTTP/1.1 302 Found\r\nLocation: http://{forbidden_addr}/admin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+                let request = TunnelRequest {
+                    id: "pms-boundary".to_owned(),
+                    method: "GET".to_owned(),
+                    path_query: path.clone(),
+                    headers: ["host", "x-forwarded-host", "forwarded"]
+                        .into_iter()
+                        .map(|name| HeaderPair {
+                            name: name.to_owned(),
+                            value: forbidden_addr.to_string(),
+                        })
+                        .collect(),
+                    upgrade: upgrade.then(|| "websocket".to_owned()),
+                };
+                let http = pms_http_client().unwrap();
+                let response = time::timeout(Duration::from_secs(2), async {
+                    if upgrade {
+                        send_local_upgrade_request(&http, &pms_url, &request).await
+                    } else {
+                        send_local_request(&http, &pms_url, &request, reqwest::Body::from("")).await
+                    }
+                })
+                .await
+                .expect("PMS response must not follow another destination")
+                .unwrap();
+                assert!(same_url_origin(response.url(), &pms_url));
+                if upgrade {
+                    assert_eq!(response.status(), 101);
+                    let mut socket = response.upgrade().await.unwrap();
+                    let mut bytes = Vec::new();
+                    socket.read_to_end(&mut bytes).await.unwrap();
+                    assert_eq!(bytes, b"plex-upgrade");
+                } else {
+                    assert_eq!(response.status(), 302);
+                    assert_eq!(
+                        response.headers()[header::LOCATION],
+                        format!("http://{forbidden_addr}/admin")
+                    );
+                }
+                server.await.unwrap();
+            }
+        }
+        assert!(time::timeout(Duration::from_millis(50), forbidden.accept())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_never_opens_a_pms_connection() {
+        for method in ["CONNECT", "connect"] {
+            for upgrade in [None, Some("websocket".to_owned())] {
+                let pms = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let cfg = Config {
+                    device_token: "test-token".to_owned(),
+                    pms_url: Url::parse(&format!("http://{}", pms.local_addr().unwrap())).unwrap(),
+                    control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+                    data_dir: std::env::temp_dir(),
+                    keepalive_profile: KeepaliveProfile::Residential,
+                    ui_addr: None,
+                };
+                let (daemon, relay, _client, _server) = local_quic_pair().await;
+                let (mut send, _recv) = relay.open_bi().await.unwrap();
+                write_json_frame(
+                    &mut send,
+                    &TunnelRequest {
+                        id: "blocked-connect".to_owned(),
+                        method: method.to_owned(),
+                        path_query: "192.0.2.10:8080".to_owned(),
+                        headers: Vec::new(),
+                        upgrade,
+                    },
+                )
+                .await
+                .unwrap();
+                send.finish().unwrap();
+                let (mut send, recv) = daemon.accept_bi().await.unwrap();
+                let error = forward_request_inner(
+                    pms_http_client().unwrap(),
+                    cfg.pms_url.clone(),
+                    &mut send,
+                    recv,
+                    UiState::new(&cfg),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.to_string(), "HTTP CONNECT is not supported");
+                assert!(time::timeout(Duration::from_millis(50), pms.accept())
+                    .await
+                    .is_err());
+            }
+        }
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
 deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME}}"
 
 if [ "$deploy_target" = "main" ] || [ "$deploy_target" = "production" ]; then
-  default_image="ghcr.io/${repo_lc}:prod"
+  require_vars PORTLESS_CLIENT_DEPLOY_IMAGE
   nas_target_name="production"
   deploy_primary_staging=0
 elif [ "$deploy_target" = "dev" ] || [ "$deploy_target" = "staging" ]; then
@@ -32,6 +32,16 @@ elif [ "$deploy_target" = "dev" ] || [ "$deploy_target" = "staging" ]; then
 else
   echo "::error title=Deploy target invalid::Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
   exit 1
+fi
+
+if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
+  image_prefix="ghcr.io/${repo_lc}:sha-"
+  image_sha="${PORTLESS_CLIENT_DEPLOY_IMAGE#"$image_prefix"}"
+  if [ "$PORTLESS_CLIENT_DEPLOY_IMAGE" != "${image_prefix}${image_sha}" ] ||
+    [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "::error title=Invalid client image::Select a portless-client image tagged with a full commit SHA"
+    exit 1
+  fi
 fi
 
 deploy_stack() {
@@ -81,10 +91,10 @@ deploy_stack() {
   }
 
   local client_image
-  if [ "${DAEMON_CHANGED}" = "true" ]; then
+  if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
+    client_image="$PORTLESS_CLIENT_DEPLOY_IMAGE"
+  elif [ "${DAEMON_CHANGED:-false}" = "true" ]; then
     client_image="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
-  elif [ "${PORTLESS_CLIENT_USE_DEFAULT_IMAGE:-}" = "true" ]; then
-    client_image="$default_image"
   else
     client_image="$(current_env_value PORTLESS_CLIENT_IMAGE)"
     if [ -z "$client_image" ] || [ "$client_image" = "null" ]; then

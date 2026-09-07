@@ -85,7 +85,55 @@ primary deploy target:
 `main` publishes the production image but does not deploy it automatically.
 `dev` deploys both configured staging targets. Production deployment is manual:
 run the `Deploy Production Client` workflow from GitHub after the main CI run
-has published the image you want to ship.
+has published the image you want to ship. Supply `client_image` as
+`ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>`; mutable
+`prod`/`latest` tags are not accepted by the production deployment workflow.
+
+## Network Boundary And Firewall Recommendations
+
+Public requests are forwarded only to the origin configured in
+`PORTLESS_PMS_URL`. Request paths and headers cannot select another destination.
+The daemon does not follow Plex redirects, does not use environment HTTP proxies
+for Plex requests, and rejects HTTP `CONNECT`. WebSocket upgrades remain on the
+connection to that same Plex server. Point this setting directly at Plex, not a
+general-purpose HTTP proxy or a reverse proxy serving other local applications.
+
+Plex still owns authentication and authorization for its exposed endpoints.
+Keep Plex patched and do not include the daemon's source address or Docker
+subnet in Plex's **List of IP addresses and networks that are allowed without
+auth**. Doing so can make tunneled Internet traffic exempt from authentication.
+See [Plex local-network authentication](https://support.plex.tv/articles/200890058-authentication-for-local-network-access/).
+
+The Compose templates run the non-root image with all capabilities dropped,
+`no-new-privileges`, and a read-only root filesystem. Only the state volume is
+writable. These restrictions are not an outbound network firewall: compromise
+of the daemon or Plex requires a separate host/router boundary for containment.
+No firewall helper is installed by Portless.
+
+Recommended host-owned policy, scoped to the daemon's container network:
+
+| Traffic | Allow |
+| --- | --- |
+| Plex | Only the configured Plex IP and TCP port (normally `32400`). |
+| Control | The configured control endpoint's IPs and TCP port (normally `connect.portless.io:443`). |
+| Relay | The assigned relay endpoint's IPs and UDP port (normally `443`; use its actual configured port). |
+| DNS | Only your chosen resolver's IP, UDP/TCP `53`, when name resolution is needed. |
+| Replies | Responses to permitted connections and your explicitly allowed local status-UI connections. |
+| Other destinations | Deny, including NAS administration, other host ports, sibling containers, and other LANs. |
+
+Apply equivalent IPv4 and IPv6 policy, or disable IPv6 for this network. Keep
+endpoint address sets current through a trusted host-side process; do not let
+the daemon widen its own allowlist. A router VLAN rule alone does not cover
+same-host or same-VLAN traffic. With Docker's iptables backend, forwarded
+traffic is filtered in `DOCKER-USER`; host-destination traffic also needs host
+input rules. Preserve Docker's managed rules and do not assume an ordinary UFW
+rule covers container traffic. See [Docker firewall guidance](https://docs.docker.com/engine/network/firewall-iptables/).
+
+Keep the status UI bound to host loopback or disable it. Do not use privileged
+or host-network mode, mount the Docker socket, or attach the daemon to shared
+application networks. After changing firewall policy, verify Plex playback,
+seeking, WebSockets and reconnects, then verify that disallowed host/LAN
+destinations fail from the daemon's network. Repeat after host/Docker restarts.
 
 ## Images and Verification
 
