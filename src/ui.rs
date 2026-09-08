@@ -33,6 +33,8 @@ pub struct UiState {
 #[derive(Clone, Serialize)]
 struct UiSnapshot {
     status: DaemonStatus,
+    #[serde(skip)]
+    connection: Option<quinn::Connection>,
     pms_url: String,
     control_url: String,
     data_dir: String,
@@ -65,6 +67,7 @@ impl UiState {
         Self {
             inner: Arc::new(RwLock::new(UiSnapshot {
                 status: DaemonStatus::Starting,
+                connection: None,
                 pms_url: cfg.pms_url.to_string(),
                 control_url: cfg.control_url.to_string(),
                 data_dir: cfg.data_dir.display().to_string(),
@@ -96,6 +99,22 @@ impl UiState {
 
     pub async fn set_status(&self, status: DaemonStatus) {
         self.inner.write().await.status = status;
+    }
+
+    pub async fn set_connection(&self, connection: quinn::Connection) {
+        let mut snapshot = self.inner.write().await;
+        snapshot.connection = Some(connection);
+        snapshot.status = DaemonStatus::Connected;
+    }
+
+    #[cfg(unix)]
+    pub async fn is_connected(&self) -> bool {
+        let snapshot = self.inner.read().await;
+        snapshot.status == DaemonStatus::Connected
+            && snapshot
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.close_reason().is_none())
     }
 
     async fn snapshot(&self) -> UiSnapshot {
@@ -539,6 +558,7 @@ mod tests {
     fn dashboard_keeps_relay_without_duplicate_control_status() {
         let snapshot = UiSnapshot {
             status: DaemonStatus::Connected,
+            connection: None,
             pms_url: "http://plex:32400/".to_owned(),
             control_url: "https://portless.io/".to_owned(),
             data_dir: "/var/lib/portless".to_owned(),
@@ -607,6 +627,7 @@ mod tests {
     fn dashboard_links_svg_favicon() {
         let snapshot = UiSnapshot {
             status: DaemonStatus::Connected,
+            connection: None,
             pms_url: "http://plex:32400/".to_owned(),
             control_url: "https://portless.io/".to_owned(),
             data_dir: "/var/lib/portless".to_owned(),

@@ -1,6 +1,10 @@
 services:
   portless-daemon:
     build: .
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
     env_file: .env.example
     extra_hosts:
       - "host.docker.internal:host-gateway"
