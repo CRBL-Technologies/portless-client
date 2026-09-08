@@ -212,7 +212,7 @@ PY
   pull_image "$client_image"
   local expected_image_id image_json
   image_json="$(curl -sf --max-time 30 "${auth_headers[@]}" \
-    "$api/endpoints/$stack_endpoint_id/docker/images/$(urlencode "$client_image")/json")"
+    "$api/endpoints/$stack_endpoint_id/docker/images/$client_image/json")"
   if ! jq -e '.Config.Healthcheck.Test == ["CMD", "/usr/local/bin/portless-daemon", "healthcheck"]' <<< "$image_json" >/dev/null; then
     echo "::error title=Client image upgrade required::Select a healthcheck-enabled client image before updating this stack" >&2
     exit 1
