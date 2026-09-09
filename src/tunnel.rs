@@ -2713,6 +2713,72 @@ mod tests {
     }
 
     async fn local_quic_pair() -> (Connection, Connection, Endpoint, Endpoint) {
+        local_quic_pair_with_gate(None).await
+    }
+
+    #[derive(Debug, Default)]
+    struct TransmitGate {
+        closed: std::sync::atomic::AtomicBool,
+        dropped: AtomicUsize,
+    }
+
+    impl TransmitGate {
+        fn open(&self) {
+            self.closed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedUdpSocket {
+        inner: Arc<dyn quinn::AsyncUdpSocket>,
+        gate: Arc<TransmitGate>,
+    }
+
+    impl quinn::AsyncUdpSocket for GatedUdpSocket {
+        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+            if self.gate.closed.load(Ordering::SeqCst) {
+                // Model wire loss, not socket backpressure: WouldBlock leaves a cached
+                // transmit that Quinn can retry even after the connection is closed.
+                self.gate.dropped.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            bufs: &mut [io::IoSliceMut<'_>],
+            meta: &mut [quinn::udp::RecvMeta],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            self.inner.max_transmit_segments()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
+
+    async fn local_quic_pair_with_gate(
+        gate: Option<Arc<TransmitGate>>,
+    ) -> (Connection, Connection, Endpoint, Endpoint) {
+        use quinn::Runtime;
         use rustls::pki_types::PrivatePkcs8KeyDer;
 
         let key_pair = KeyPair::generate().unwrap();
@@ -2730,7 +2796,21 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(cert_der).unwrap();
         let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
-        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = if let Some(gate) = gate {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                None,
+                Arc::new(GatedUdpSocket {
+                    inner: quinn::TokioRuntime.wrap_udp_socket(socket).unwrap(),
+                    gate,
+                }),
+                Arc::new(quinn::TokioRuntime),
+            )
+            .unwrap()
+        } else {
+            Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap()
+        };
         client.set_default_client_config(client_config);
 
         let connect = client.connect(server_addr, "localhost").unwrap();
@@ -2738,6 +2818,225 @@ mod tests {
             server.accept().await.unwrap().await.unwrap()
         });
         (daemon_conn.unwrap(), relay_conn, client, server)
+    }
+
+    #[tokio::test]
+    async fn delayed_response_tail_survives_real_connection_drain() {
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The second run is the pre-fix control: finish queues FIN, then the guard drops.
+        for finish_only in [false, true] {
+            time::timeout(Duration::from_secs(30), async {
+                let body: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+                let prefix_len = 1024;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (release_tail, tail_ready) = tokio::sync::oneshot::channel();
+                let server_body = body.clone();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                        assert!(request.len() < 8192);
+                    }
+                    socket
+                        .write_all(
+                            format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        server_body.len(),
+                    )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    socket.write_all(&server_body[..prefix_len]).await.unwrap();
+                    tail_ready.await.unwrap();
+                    socket.write_all(&server_body[prefix_len..]).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let cfg = Config {
+                    pms_url: Url::parse(&format!("http://{addr}")).unwrap(),
+                    control_url: Url::parse("http://127.0.0.1:1").unwrap(),
+                    device_token: "test-token".to_owned(),
+                    data_dir: std::env::temp_dir(),
+                    keepalive_profile: KeepaliveProfile::Residential,
+                    ui_addr: None,
+                };
+                let gate = Arc::new(TransmitGate::default());
+                let (daemon, relay, client, _server) = time::timeout(
+                    Duration::from_secs(3),
+                    local_quic_pair_with_gate(Some(gate.clone())),
+                )
+                .await
+                .expect("gated QUIC handshake");
+                let (mut upload, mut download) = relay.open_bi().await.unwrap();
+                write_json_frame(
+                    &mut upload,
+                    &TunnelRequest {
+                        id: "delayed-tail".to_owned(),
+                        method: "GET".to_owned(),
+                        path_query: "/library/parts/7490/1725460000/file.mp4".to_owned(),
+                        headers: vec![],
+                        upgrade: None,
+                    },
+                )
+                .await
+                .unwrap();
+                upload.finish().unwrap();
+                let (mut send, recv) = daemon.accept_bi().await.unwrap();
+                let delivered = send.stopped();
+                tokio::pin!(delivered);
+                let active = Arc::new(AtomicUsize::new(0));
+                let guard = ActiveForwardedStream::new(active.clone());
+                let connection = daemon.clone();
+                let mut forwarding = tokio::spawn(async move {
+                    let _guard = guard;
+                    let http = pms_http_client().unwrap();
+                    if finish_only {
+                        forward_request_inner(
+                            http,
+                            cfg.pms_url.clone(),
+                            &mut send,
+                            recv,
+                            UiState::new(&cfg),
+                        )
+                        .await
+                    } else {
+                        forward_request(
+                            http,
+                            cfg.pms_url.clone(),
+                            connection,
+                            send,
+                            recv,
+                            UiState::new(&cfg),
+                        )
+                        .await
+                    }
+                });
+                let head: TunnelResponseHead =
+                    time::timeout(Duration::from_secs(3), read_json_frame(&mut download))
+                        .await
+                        .expect("response head")
+                        .unwrap();
+                assert_eq!(head.status, 200);
+                let mut received = vec![0; prefix_len];
+                time::timeout(Duration::from_secs(3), download.read_exact(&mut received))
+                    .await
+                    .expect("response prefix")
+                    .unwrap();
+                assert_eq!(received, body[..prefix_len]);
+
+                // No tail exists in QUIC yet. Drop outbound UDP before PMS releases it;
+                // delivery after reopening requires QUIC loss recovery, not a cached send.
+                gate.closed.store(true, Ordering::SeqCst);
+                release_tail.send(()).unwrap();
+                time::timeout(Duration::from_secs(3), server)
+                    .await
+                    .expect("PMS tail sent")
+                    .unwrap();
+                let mut reader = tokio::spawn(async move { download.read_to_end(8192).await });
+                time::timeout(Duration::from_secs(3), async {
+                    while gate.dropped.load(Ordering::SeqCst) == 0 {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("UDP transmit was dropped by the gate");
+                assert!(
+                    time::timeout(Duration::from_millis(50), &mut delivered)
+                        .await
+                        .is_err(),
+                    "response must be unacknowledged before starting the drain"
+                );
+                spawn_connection_drain(
+                    client,
+                    daemon.clone(),
+                    active.clone(),
+                    _server.local_addr().unwrap(),
+                );
+                let hold = DRAIN_IDLE_GUARD + DRAIN_POLL_INTERVAL * 2;
+                if finish_only {
+                    time::timeout(Duration::from_secs(2), &mut forwarding)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(active.load(Ordering::Relaxed), 0);
+                    assert!(matches!(
+                        time::timeout(hold, daemon.closed())
+                            .await
+                            .expect("finish-only control must close while the tail is lost"),
+                        quinn::ConnectionError::LocallyClosed
+                    ));
+                } else {
+                    assert!(
+                        time::timeout(hold, &mut delivered).await.is_err(),
+                        "tail/FIN cannot be ACKed while UDP transmission is gated"
+                    );
+                    assert_eq!(
+                        active.load(Ordering::Relaxed),
+                        1,
+                        "forwarded stream must remain active until delivery ACK"
+                    );
+                    assert!(!forwarding.is_finished());
+                    assert!(
+                        daemon.close_reason().is_none(),
+                        "real drain closed an active response"
+                    );
+                }
+                assert!(
+                    !reader.is_finished(),
+                    "reader must still be waiting for wire delivery"
+                );
+                gate.open();
+                // Loss recovery backs off during the seven-second outage.
+                let recovery_timeout = Duration::from_secs(10);
+                if finish_only {
+                    // The initial CONNECTION_CLOSE may also have been lost. Peer traffic
+                    // elicits another close frame, without permitting stream retransmission.
+                    let _ = relay.send_datagram(b"probe".as_slice().into());
+                    let result = time::timeout(recovery_timeout, &mut reader)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        matches!(&result, Err(quinn::ReadToEndError::Read(err))
+                            if read_error_has_application_close(err, STREAM_CANCELLED)),
+                        "finish-only drain must truncate the response with its close code: {result:?}"
+                    );
+                } else {
+                    received.extend(
+                        time::timeout(recovery_timeout, &mut reader)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    assert_eq!(received.len(), body.len());
+                    assert_eq!(Sha256::digest(&received), Sha256::digest(&body));
+                    assert_eq!(
+                        time::timeout(Duration::from_secs(3), &mut delivered)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        None
+                    );
+                    time::timeout(Duration::from_secs(2), &mut forwarding)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(active.load(Ordering::Relaxed), 0);
+                    time::timeout(hold, daemon.closed())
+                        .await
+                        .expect("real drain must close after the ACK releases the guard");
+                }
+            })
+            .await
+            .expect("delayed-tail fixture timed out");
+        }
     }
 
     async fn truncating_pms_stub() -> SocketAddr {
