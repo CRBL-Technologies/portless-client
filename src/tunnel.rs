@@ -2719,14 +2719,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct TransmitGate {
         closed: std::sync::atomic::AtomicBool,
-        blocked: AtomicUsize,
-        writable: futures_util::task::AtomicWaker,
+        dropped: AtomicUsize,
     }
 
     impl TransmitGate {
         fn open(&self) {
             self.closed.store(false, Ordering::SeqCst);
-            self.writable.wake();
         }
     }
 
@@ -2736,39 +2734,17 @@ mod tests {
         gate: Arc<TransmitGate>,
     }
 
-    #[derive(Debug)]
-    struct GatedUdpPoller {
-        inner: std::pin::Pin<Box<dyn quinn::UdpPoller>>,
-        gate: Arc<TransmitGate>,
-    }
-
-    impl quinn::UdpPoller for GatedUdpPoller {
-        fn poll_writable(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            // This fixture has one connection and therefore one send waiter.
-            self.gate.writable.register(cx.waker());
-            if self.gate.closed.load(Ordering::SeqCst) {
-                self.gate.blocked.fetch_add(1, Ordering::SeqCst);
-                return std::task::Poll::Pending;
-            }
-            self.inner.as_mut().poll_writable(cx)
-        }
-    }
-
     impl quinn::AsyncUdpSocket for GatedUdpSocket {
         fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
-            Box::pin(GatedUdpPoller {
-                inner: self.inner.clone().create_io_poller(),
-                gate: self.gate.clone(),
-            })
+            self.inner.clone().create_io_poller()
         }
 
         fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
             if self.gate.closed.load(Ordering::SeqCst) {
-                self.gate.blocked.fetch_add(1, Ordering::SeqCst);
-                return Err(io::ErrorKind::WouldBlock.into());
+                // Model wire loss, not socket backpressure: WouldBlock leaves a cached
+                // transmit that Quinn can retry even after the connection is closed.
+                self.gate.dropped.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
             }
             self.inner.try_send(transmit)
         }
@@ -2952,7 +2928,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(received, body[..prefix_len]);
 
-                // No tail exists in QUIC yet. Block actual UDP transmission before PMS releases it.
+                // No tail exists in QUIC yet. Drop outbound UDP before PMS releases it;
+                // delivery after reopening requires QUIC loss recovery, not a cached send.
                 gate.closed.store(true, Ordering::SeqCst);
                 release_tail.send(()).unwrap();
                 time::timeout(Duration::from_secs(3), server)
@@ -2961,12 +2938,18 @@ mod tests {
                     .unwrap();
                 let mut reader = tokio::spawn(async move { download.read_to_end(8192).await });
                 time::timeout(Duration::from_secs(3), async {
-                    while gate.blocked.load(Ordering::SeqCst) == 0 {
+                    while gate.dropped.load(Ordering::SeqCst) == 0 {
                         time::sleep(Duration::from_millis(10)).await;
                     }
                 })
                 .await
-                .expect("UDP transmit reached the gate");
+                .expect("UDP transmit was dropped by the gate");
+                assert!(
+                    time::timeout(Duration::from_millis(50), &mut delivered)
+                        .await
+                        .is_err(),
+                    "response must be unacknowledged before starting the drain"
+                );
                 spawn_connection_drain(
                     client,
                     daemon.clone(),
@@ -2981,9 +2964,12 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     assert_eq!(active.load(Ordering::Relaxed), 0);
-                    time::timeout(hold, daemon.closed())
-                        .await
-                        .expect("finish-only control must close while the tail is blocked");
+                    assert!(matches!(
+                        time::timeout(hold, daemon.closed())
+                            .await
+                            .expect("finish-only control must close while the tail is lost"),
+                        quinn::ConnectionError::LocallyClosed
+                    ));
                 } else {
                     assert!(
                         time::timeout(hold, &mut delivered).await.is_err(),
@@ -3005,18 +2991,24 @@ mod tests {
                     "reader must still be waiting for wire delivery"
                 );
                 gate.open();
+                // Loss recovery backs off during the seven-second outage.
+                let recovery_timeout = Duration::from_secs(10);
                 if finish_only {
+                    // The initial CONNECTION_CLOSE may also have been lost. Peer traffic
+                    // elicits another close frame, without permitting stream retransmission.
+                    let _ = relay.send_datagram(b"probe".as_slice().into());
+                    let result = time::timeout(recovery_timeout, &mut reader)
+                        .await
+                        .unwrap()
+                        .unwrap();
                     assert!(
-                        time::timeout(Duration::from_secs(3), &mut reader)
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .is_err(),
-                        "finish-only drain must truncate the response"
+                        matches!(&result, Err(quinn::ReadToEndError::Read(err))
+                            if read_error_has_application_close(err, STREAM_CANCELLED)),
+                        "finish-only drain must truncate the response with its close code: {result:?}"
                     );
                 } else {
                     received.extend(
-                        time::timeout(Duration::from_secs(3), &mut reader)
+                        time::timeout(recovery_timeout, &mut reader)
                             .await
                             .unwrap()
                             .unwrap()
