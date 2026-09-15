@@ -1,12 +1,33 @@
 #!/usr/bin/env bash
+# Manual Portainer rollout of the managed client stacks. Since 2026-09-15 the
+# Portainer instances are reachable only through private Tailscale Services, so
+# this is run by an operator (normally the agent on the tailnet-connected VM),
+# never by GitHub Actions. CI still builds and pushes the images.
+#
+# Usage (from the repo root, secrets loaded with `op run`):
+#   PORTLESS_CLIENT_DEPLOY_TARGET=production \
+#   PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full sha> \
+#   deploy/scripts/deploy-client-stacks.sh
+#
+# Environment:
+#   PORTLESS_CLIENT_DEPLOY_TARGET   production | staging (GITHUB_REF_NAME main/dev also accepted)
+#   PORTLESS_CLIENT_DEPLOY_IMAGE    sha-tagged image; required for production
+#   PORTLESS_CLIENT_NAS_DEPLOY_API_URL, PORTLESS_CLIENT_NAS_DEPLOY_API_KEY,
+#   PORTLESS_CLIENT_NAS_STACK_ID, PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID
+#                                   the NAS Portainer target, e.g. http://portainer-nas.taild5214a.ts.net
+#   PORTLESS_DEPLOY_PROXY           optional HTTP proxy that reaches the tailnet, e.g. http://127.0.0.1:1055
+#   GHCR_USERNAME, GHCR_TOKEN       registry credentials Portainer uses to pull the image
+#   CF_ACCESS_CLIENT_ID/SECRET      optional; only sent when both are set
+#   PORTLESS_CLIENT_IMAGE_REPO      defaults to ghcr.io/crbl-technologies/portless-client
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 require_vars() {
   local missing=0
   local name
   for name in "$@"; do
     if [ -z "${!name:-}" ]; then
-      echo "::error title=Deploy variable missing::Missing ${name}"
+      echo "error: Missing ${name}"
       missing=1
     fi
   done
@@ -18,8 +39,9 @@ urlencode() {
 }
 
 stack_file="$(cat docker-compose.deploy.yml)"
-repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
-deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME}}"
+image_repo="${PORTLESS_CLIENT_IMAGE_REPO:-ghcr.io/${GITHUB_REPOSITORY:-CRBL-Technologies/portless-client}}"
+repo_lc="$(echo "${image_repo#ghcr.io/}" | tr '[:upper:]' '[:lower:]')"
+deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME:-}}"
 
 if [ "$deploy_target" = "main" ] || [ "$deploy_target" = "production" ]; then
   require_vars PORTLESS_CLIENT_DEPLOY_IMAGE
@@ -30,7 +52,7 @@ elif [ "$deploy_target" = "dev" ] || [ "$deploy_target" = "staging" ]; then
   nas_target_name="staging-nas"
   deploy_primary_staging=1
 else
-  echo "::error title=Deploy target invalid::Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
+  echo "error: Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
   exit 1
 fi
 
@@ -39,7 +61,7 @@ if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
   image_sha="${PORTLESS_CLIENT_DEPLOY_IMAGE#"$image_prefix"}"
   if [ "$PORTLESS_CLIENT_DEPLOY_IMAGE" != "${image_prefix}${image_sha}" ] ||
     [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "::error title=Invalid client image::Select a portless-client image tagged with a full commit SHA"
+    echo "error: Select a portless-client image tagged with a full commit SHA"
     exit 1
   fi
 fi
@@ -51,22 +73,26 @@ deploy_stack() {
   local stack_id="$4"
   local endpoint_id_fallback="$5"
 
-  require_vars CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN
+  require_vars GHCR_USERNAME GHCR_TOKEN
 
   if [ -z "$api_url" ] || [ -z "$api_key" ] || [ -z "$stack_id" ]; then
-    echo "::error title=Deploy target incomplete::${target_name} is missing URL, API key, or stack ID"
+    echo "error: ${target_name} is missing URL, API key, or stack ID"
     exit 1
   fi
 
   local api="${api_url%/}/api"
-  local auth_headers=(-A "crbl-ops/1.0" \
-    -H "X-API-Key: ${api_key}" \
-    -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
-    -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+  local auth_headers=(-A "crbl-ops/1.0" -H "X-API-Key: ${api_key}")
+  if [ -n "${PORTLESS_DEPLOY_PROXY:-}" ]; then
+    auth_headers+=(-x "${PORTLESS_DEPLOY_PROXY}")
+  fi
+  if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+    auth_headers+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+      -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+  fi
 
   local stack_resp
   if ! stack_resp="$(curl -sf --max-time 30 "${auth_headers[@]}" "$api/stacks/${stack_id}")"; then
-    echo "::error title=Deploy stack fetch failed::${target_name} stack ${stack_id} could not be fetched"
+    echo "error: ${target_name} stack ${stack_id} could not be fetched"
     exit 1
   fi
 
@@ -78,7 +104,7 @@ deploy_stack() {
     stack_endpoint_id="$endpoint_id_fallback"
   fi
   if [ -z "$stack_endpoint_id" ]; then
-    echo "::error title=Deploy endpoint missing::${target_name} stack ${stack_id} did not include EndpointId"
+    echo "error: ${target_name} stack ${stack_id} did not include EndpointId"
     exit 1
   fi
 
@@ -94,6 +120,10 @@ deploy_stack() {
   if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
     client_image="$PORTLESS_CLIENT_DEPLOY_IMAGE"
   elif [ "${DAEMON_CHANGED:-false}" = "true" ]; then
+    if [ -z "${GITHUB_SHA:-}" ]; then
+      echo "error: DAEMON_CHANGED=true needs GITHUB_SHA, or pass PORTLESS_CLIENT_DEPLOY_IMAGE"
+      exit 1
+    fi
     client_image="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
   else
     client_image="$(current_env_value PORTLESS_CLIENT_IMAGE)"
@@ -186,7 +216,7 @@ PY
       "$api/endpoints/${stack_endpoint_id}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
     if ! jq -se 'length > 0 and all(.[]; .error == null and .errorDetail == null)' "$pull_response" >/dev/null; then
       rm -f "$pull_response"
-      echo "::error title=Image pull failed::Registry did not confirm the requested client image" >&2
+      echo "error: Registry did not confirm the requested client image" >&2
       return 1
     fi
     rm -f "$pull_response"
@@ -205,7 +235,7 @@ PY
     echo "${target_name} endpoint warmup ${i}/10 returned HTTP ${status}"
   done
   if [ "$endpoint_ready" -ne 1 ]; then
-    echo "::error title=Deploy endpoint unavailable::${target_name} endpoint ${stack_endpoint_id} did not become ready"
+    echo "error: ${target_name} endpoint ${stack_endpoint_id} did not become ready"
     exit 1
   fi
 
@@ -214,7 +244,7 @@ PY
   image_json="$(curl -sf --max-time 30 "${auth_headers[@]}" \
     "$api/endpoints/$stack_endpoint_id/docker/images/$client_image/json")"
   if ! jq -e '.Config.Healthcheck.Test == ["CMD", "/usr/local/bin/portless-daemon", "healthcheck"]' <<< "$image_json" >/dev/null; then
-    echo "::error title=Client image upgrade required::Select a healthcheck-enabled client image before updating this stack" >&2
+    echo "error: Select a healthcheck-enabled client image before updating this stack" >&2
     exit 1
   fi
   expected_image_id="$(jq -er '.Id' <<< "$image_json")"
@@ -225,7 +255,7 @@ PY
     -o /dev/null \
     -d @"$payload_file" \
     "$api/stacks/${stack_id}?endpointId=${stack_endpoint_id}"; then
-    echo "::error title=Deploy stack update failed::${target_name} stack ${stack_id} update failed"
+    echo "error: ${target_name} stack ${stack_id} update failed"
     exit 1
   fi
 
@@ -244,7 +274,7 @@ PY
     sleep 3
   done
   if [ "$verified" -ne 1 ]; then
-    echo "::error title=Deploy verification failed::${target_name} stored stack file did not match repository compose file within the verification window"
+    echo "error: ${target_name} stored stack file did not match repository compose file within the verification window"
     exit 1
   fi
 
@@ -266,7 +296,7 @@ PY
     [ "$i" -eq 36 ] || sleep 5
   done
   if [ "$verified" -ne 1 ]; then
-    echo "::error title=Deploy verification failed::${target_name} client did not become healthy with the requested image"
+    echo "error: ${target_name} client did not become healthy with the requested image"
     exit 1
   fi
 

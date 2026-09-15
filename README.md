@@ -41,8 +41,8 @@ Open `http://127.0.0.1:43180/` for local daemon status.
 
 ## Managed Portainer Deployments
 
-`docker-compose.deploy.yml` is the Portainer stack template used by CI. The
-stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`; CI only
+`docker-compose.deploy.yml` is the Portainer stack template. The stack owns
+customer-specific settings, including `PORTLESS_DEVICE_TOKEN`; a deploy only
 updates the stack file and `PORTLESS_CLIENT_IMAGE`.
 
 Managed stacks run the daemon on Docker bridge networking and map
@@ -64,30 +64,35 @@ Optional stack environment:
 - `PORTLESS_UI_PUBLISH_ADDR` - host-side UI publish address, default
   `127.0.0.1:43180`.
 
-The GitHub `staging` and `production` environments must provide:
+### Deploys are manual
 
-- `OP_SERVICE_ACCOUNT_TOKEN` as a secret.
-- `OP_ENVIRONMENT_ID`
-- `PORTLESS_CLIENT_NAS_DEPLOY_API_URL`
-- `PORTLESS_CLIENT_NAS_DEPLOY_API_KEY` as a secret.
-- `PORTLESS_CLIENT_NAS_STACK_ID`
-- `PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID`
+**Since 2026-09-15 nothing deploys automatically.** `Client CI/CD` tests the
+daemon and, on pushes to `dev` and `main`, builds, signs and pushes
+`ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>` (plus the
+mutable `dev` / `prod` tags). The NAS Portainer that runs the production stack
+is reachable only through a private Tailscale Service, which GitHub-hosted
+runners cannot reach, so the former `Deploy Client` job and the
+`Deploy Production Client` workflow were removed.
 
-The 1Password Environment referenced by `OP_ENVIRONMENT_ID` provides the
-primary deploy target:
+The agent operating the deployment runs `deploy/scripts/deploy-client-stacks.sh`
+from the tailnet-connected VM, after the CI run has published the image to ship
+and with explicit authorization for the NAS change:
 
-- `PORTLESS_CLIENT_DEPLOY_API_URL`
-- `PORTLESS_CLIENT_DEPLOY_API_KEY`
-- `PORTLESS_CLIENT_STACK_ID`
-- `CF_ACCESS_CLIENT_ID`
-- `CF_ACCESS_CLIENT_SECRET`
+```sh
+export OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.config/op/op_service_account_token)"
+export PORTLESS_DEPLOY_PROXY=http://127.0.0.1:1055
+export PORTLESS_CLIENT_NAS_DEPLOY_API_URL=http://portainer-nas.taild5214a.ts.net
+export PORTLESS_CLIENT_NAS_STACK_ID=2 PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID=3
+PORTLESS_CLIENT_DEPLOY_TARGET=production \
+PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA> \
+op run --env-file ~/.config/portless/deploy.op.env -- deploy/scripts/deploy-client-stacks.sh
+```
 
-`main` publishes the production image but does not deploy it automatically.
-`dev` deploys both configured staging targets. Production deployment is manual:
-run the `Deploy Production Client` workflow from GitHub after the main CI run
-has published the image you want to ship. Supply `client_image` as
-`ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>`; mutable
-`prod`/`latest` tags are not accepted by the production deployment workflow.
+The script needs `PORTLESS_CLIENT_NAS_DEPLOY_API_KEY` (from 1Password) and
+`GHCR_USERNAME` / `GHCR_TOKEN` so Portainer can pull the image. Mutable
+`prod`/`latest` tags are rejected; only healthcheck-enabled `sha-*` images are
+accepted. `deploy/scripts/deploy-client-stacks.test.sh` exercises the rollout
+verification against a stubbed Portainer API.
 
 ## Network Boundary And Firewall Recommendations
 

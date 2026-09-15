@@ -76,7 +76,7 @@ for scenario in healthy stopped restarting unhealthy old-image bad-compose old-c
     sleep() { :; }
     export -f curl sleep
     export scenario work_dir
-    bash .github/scripts/deploy-client-stacks.sh
+    bash deploy/scripts/deploy-client-stacks.sh
   ) >"$work_dir/result" 2>&1; then
     [ "$scenario" = healthy ] || { echo "Incorrect success: $scenario" >&2; exit 1; }
   else
