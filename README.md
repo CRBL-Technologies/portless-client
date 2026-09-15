@@ -83,16 +83,28 @@ export OP_SERVICE_ACCOUNT_TOKEN="$(cat ~/.config/op/op_service_account_token)"
 export PORTLESS_DEPLOY_PROXY=http://127.0.0.1:1055
 export PORTLESS_CLIENT_NAS_DEPLOY_API_URL=http://portainer-nas.taild5214a.ts.net
 export PORTLESS_CLIENT_NAS_STACK_ID=2 PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID=3
+export PORTLESS_CLIENT_NAS_REGISTRY_ID=<existing Portainer registry ID>
 PORTLESS_CLIENT_DEPLOY_TARGET=production \
 PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA> \
 op run --env-file ~/.config/portless/deploy.op.env -- deploy/scripts/deploy-client-stacks.sh
 ```
 
-The script needs `PORTLESS_CLIENT_NAS_DEPLOY_API_KEY` (from 1Password) and
-`GHCR_USERNAME` / `GHCR_TOKEN` so Portainer can pull the image. Mutable
-`prod`/`latest` tags are rejected; only healthcheck-enabled `sha-*` images are
-accepted. `deploy/scripts/deploy-client-stacks.test.sh` exercises the rollout
-verification against a stubbed Portainer API.
+Each target Portainer must already have a registry entry that can pull
+`ghcr.io/crbl-technologies/portless-client` and is authorized for the Portainer
+identity used by the deployment API key. Set
+`PORTLESS_CLIENT_NAS_REGISTRY_ID` to that entry's positive integer ID on the NAS
+Portainer. Staging also requires `PORTLESS_CLIENT_REGISTRY_ID` for the primary
+Portainer; registry IDs are local to each Portainer and are not interchangeable.
+The script sends only that ID through Portainer's `X-Registry-Auth` mechanism.
+It does not fetch, store, or forward registry usernames or passwords. Keep the
+registry credential in Portainer and do not copy credentials from this VM into
+the stack or deployment environment. See the
+[Portainer API authentication header contract](https://github.com/portainer/portainer/blob/develop/api/api.md#L46-L53).
+
+The script still needs the target Portainer API key. Mutable `prod`/`latest`
+tags are rejected; only healthcheck-enabled `sha-*` images are accepted.
+`deploy/scripts/deploy-client-stacks.test.sh` exercises the rollout verification
+against a stubbed Portainer API.
 
 ## Network Boundary And Firewall Recommendations
 

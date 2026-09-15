@@ -13,10 +13,11 @@
 #   PORTLESS_CLIENT_DEPLOY_TARGET   production | staging (GITHUB_REF_NAME main/dev also accepted)
 #   PORTLESS_CLIENT_DEPLOY_IMAGE    sha-tagged image; required for production
 #   PORTLESS_CLIENT_NAS_DEPLOY_API_URL, PORTLESS_CLIENT_NAS_DEPLOY_API_KEY,
-#   PORTLESS_CLIENT_NAS_STACK_ID, PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID
+#   PORTLESS_CLIENT_NAS_STACK_ID, PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID,
+#   PORTLESS_CLIENT_NAS_REGISTRY_ID
 #                                   the NAS Portainer target, e.g. http://portainer-nas.taild5214a.ts.net
+#   PORTLESS_CLIENT_REGISTRY_ID     the primary staging Portainer registry ID
 #   PORTLESS_DEPLOY_PROXY           optional HTTP proxy that reaches the tailnet, e.g. http://127.0.0.1:1055
-#   GHCR_USERNAME, GHCR_TOKEN       registry credentials Portainer uses to pull the image
 #   CF_ACCESS_CLIENT_ID/SECRET      optional; only sent when both are set
 #   PORTLESS_CLIENT_IMAGE_REPO      defaults to ghcr.io/crbl-technologies/portless-client
 set -euo pipefail
@@ -36,6 +37,15 @@ require_vars() {
 
 urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
+}
+
+validate_registry_id() {
+  local target_name="$1"
+  local registry_id="$2"
+  if [[ ! "$registry_id" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: ${target_name} registry ID must be a positive integer"
+    return 1
+  fi
 }
 
 stack_file="$(cat docker-compose.deploy.yml)"
@@ -72,8 +82,7 @@ deploy_stack() {
   local api_key="$3"
   local stack_id="$4"
   local endpoint_id_fallback="$5"
-
-  require_vars GHCR_USERNAME GHCR_TOKEN
+  local registry_id="$6"
 
   if [ -z "$api_url" ] || [ -z "$api_key" ] || [ -z "$stack_id" ]; then
     echo "error: ${target_name} is missing URL, API key, or stack ID"
@@ -174,8 +183,8 @@ deploy_stack() {
   fi
 
   local env_file payload_file
-  env_file="$(mktemp)"
-  payload_file="$(mktemp)"
+  env_file="$temp_dir/env.json"
+  payload_file="$temp_dir/payload.json"
   printf '%s' "$env_json" > "$env_file"
   local expected_config_hash
   expected_config_hash="$(python3 - "$env_file" "$stack_name" <<'PY'
@@ -204,22 +213,19 @@ PY
     local tag="${image##*:}"
     local registry_auth
     local pull_response
-    pull_response="$(mktemp)"
+    pull_response="$temp_dir/pull-response.json"
     registry_auth="$(jq -nc \
-      --arg username "$GHCR_USERNAME" \
-      --arg password "$GHCR_TOKEN" \
-      '{"username":$username,"password":$password,"serveraddress":"ghcr.io"}' | base64 -w0)"
+      --argjson registry_id "$registry_id" \
+      '{registryId:$registry_id}' | base64 -w0)"
     curl -sf --max-time 300 -X POST \
       "${auth_headers[@]}" \
       -H "X-Registry-Auth: ${registry_auth}" \
       -o "$pull_response" \
       "$api/endpoints/${stack_endpoint_id}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
     if ! jq -se 'length > 0 and all(.[]; .error == null and .errorDetail == null)' "$pull_response" >/dev/null; then
-      rm -f "$pull_response"
       echo "error: Registry did not confirm the requested client image" >&2
       return 1
     fi
-    rm -f "$pull_response"
   }
 
   local endpoint_ready=0
@@ -301,30 +307,46 @@ PY
   fi
 
   echo "Deployed ${target_name} stack ${stack_id} on endpoint ${stack_endpoint_id} with image ${client_image}"
-  rm -f "$env_file" "$payload_file"
 }
 
 if [ "$deploy_primary_staging" -eq 1 ]; then
   require_vars \
     PORTLESS_CLIENT_DEPLOY_API_URL \
     PORTLESS_CLIENT_DEPLOY_API_KEY \
-    PORTLESS_CLIENT_STACK_ID
-  deploy_stack \
-    "staging-primary" \
-    "$PORTLESS_CLIENT_DEPLOY_API_URL" \
-    "$PORTLESS_CLIENT_DEPLOY_API_KEY" \
-    "$PORTLESS_CLIENT_STACK_ID" \
-    "${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}"
+    PORTLESS_CLIENT_STACK_ID \
+    PORTLESS_CLIENT_REGISTRY_ID
 fi
 
 require_vars \
   PORTLESS_CLIENT_NAS_DEPLOY_API_URL \
   PORTLESS_CLIENT_NAS_DEPLOY_API_KEY \
   PORTLESS_CLIENT_NAS_STACK_ID \
-  PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID
+  PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID \
+  PORTLESS_CLIENT_NAS_REGISTRY_ID
+
+if [ "$deploy_primary_staging" -eq 1 ]; then
+  validate_registry_id "staging-primary" "$PORTLESS_CLIENT_REGISTRY_ID"
+fi
+validate_registry_id "$nas_target_name" "$PORTLESS_CLIENT_NAS_REGISTRY_ID"
+
+temp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$temp_dir"' EXIT
+chmod 700 "$temp_dir"
+
+if [ "$deploy_primary_staging" -eq 1 ]; then
+  deploy_stack \
+    "staging-primary" \
+    "$PORTLESS_CLIENT_DEPLOY_API_URL" \
+    "$PORTLESS_CLIENT_DEPLOY_API_KEY" \
+    "$PORTLESS_CLIENT_STACK_ID" \
+    "${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}" \
+    "$PORTLESS_CLIENT_REGISTRY_ID"
+fi
+
 deploy_stack \
   "$nas_target_name" \
   "$PORTLESS_CLIENT_NAS_DEPLOY_API_URL" \
   "$PORTLESS_CLIENT_NAS_DEPLOY_API_KEY" \
   "$PORTLESS_CLIENT_NAS_STACK_ID" \
-  "$PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID"
+  "$PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID" \
+  "$PORTLESS_CLIENT_NAS_REGISTRY_ID"
