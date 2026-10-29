@@ -41,9 +41,10 @@ Open `http://127.0.0.1:43180/` for local daemon status.
 
 ## Managed Portainer Deployments
 
-`docker-compose.deploy.yml` is the Portainer stack template used by CI. The
-stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`; CI only
-updates the stack file and `PORTLESS_CLIENT_IMAGE`.
+`docker-compose.deploy.yml` is the existing operator-managed stack template.
+The stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`.
+CI builds and publishes images only; it never updates a stack or dispatches a
+deployment. The public daemon does not require 1Password.
 
 Managed stacks run the daemon on Docker bridge networking and map
 `host.docker.internal` to the Docker host gateway. When Plex Media Server runs on
@@ -64,30 +65,13 @@ Optional stack environment:
 - `PORTLESS_UI_PUBLISH_ADDR` - host-side UI publish address, default
   `127.0.0.1:43180`.
 
-The GitHub `staging` and `production` environments must provide:
-
-- `OP_SERVICE_ACCOUNT_TOKEN` as a secret.
-- `OP_ENVIRONMENT_ID`
-- `PORTLESS_CLIENT_NAS_DEPLOY_API_URL`
-- `PORTLESS_CLIENT_NAS_DEPLOY_API_KEY` as a secret.
-- `PORTLESS_CLIENT_NAS_STACK_ID`
-- `PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID`
-
-The 1Password Environment referenced by `OP_ENVIRONMENT_ID` provides the
-primary deploy target:
-
-- `PORTLESS_CLIENT_DEPLOY_API_URL`
-- `PORTLESS_CLIENT_DEPLOY_API_KEY`
-- `PORTLESS_CLIENT_STACK_ID`
-- `CF_ACCESS_CLIENT_ID`
-- `CF_ACCESS_CLIENT_SECRET`
-
-`main` publishes the production image but does not deploy it automatically.
-`dev` deploys both configured staging targets. Production deployment is manual:
-run the `Deploy Production Client` workflow from GitHub after the main CI run
-has published the image you want to ship. Supply `client_image` as
-`ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>`; mutable
-`prod`/`latest` tags are not accepted by the production deployment workflow.
+Both `main` and `dev` publish without deployment. The existing
+`.github/scripts/deploy-client-stacks.sh` remains an explicitly invoked operator
+tool. Its production path requires `PORTLESS_CLIENT_DEPLOY_TARGET=production`
+and `PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>`.
+Operators must resolve and authorize the target before running it. Do not
+activate a retired staging target merely because its code path still exists.
+Mutable `prod`/`latest` tags are not accepted by the production deployment tool.
 
 ## Network Boundary And Firewall Recommendations
 
