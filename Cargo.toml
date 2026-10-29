@@ -11,7 +11,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
 futures-util = "0.3"
-getrandom = "0.3"
+getrandom = { version = "0.3", features = ["std"] }
 portless-contracts = { git = "https://github.com/CRBL-Technologies/portless-contracts", tag = "v1.0.3" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
