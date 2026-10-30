@@ -143,21 +143,33 @@ async fn serve_inner(addr: SocketAddr, state: UiState) -> Result<()> {
             .await
             .context("accept client UI request")?;
         let state = state.clone();
+        let loopback_only = addr.ip().is_loopback();
         tokio::spawn(async move {
-            if let Err(err) = handle(stream, state).await {
+            if let Err(err) = handle(stream, state, loopback_only).await {
                 debug!(%peer, error = %err, "client UI request failed");
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
+async fn handle(mut stream: TcpStream, state: UiState, loopback_only: bool) -> Result<()> {
     let mut buf = [0_u8; 2048];
     let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut buf))
         .await
         .context("read request timed out")?
         .context("read request")?;
     let request = String::from_utf8_lossy(&buf[..n]);
+    // A loopback-only UI must not answer pages that reached it through DNS
+    // rebinding, where the browser sends the attacker's host name.
+    if loopback_only && !request_host(&request).is_some_and(is_loopback_host) {
+        return write_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "forbidden host\n",
+        )
+        .await;
+    }
     let path = request_path(&request);
 
     match path {
@@ -202,6 +214,26 @@ fn request_path(request: &str) -> &str {
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
     path.split_once('?').map_or(path, |(path, _)| path)
+}
+
+fn request_host(request: &str) -> Option<&str> {
+    request.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim())
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(name, _)| name),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn write_response(
@@ -652,6 +684,37 @@ mod tests {
             .contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">"#));
         assert!(FAVICON_SVG.contains(r##"fill="#1f2933""##));
         assert!(FAVICON_SVG.contains(r##"stroke="#b7791f""##));
+    }
+
+    #[test]
+    fn loopback_host_check_rejects_rebound_names() {
+        let request = |host: &str| format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        for host in [
+            "127.0.0.1:43180",
+            "localhost:43180",
+            "LOCALHOST",
+            "[::1]:43180",
+            "127.0.0.2",
+        ] {
+            let raw = request(host);
+            assert!(
+                request_host(&raw).is_some_and(is_loopback_host),
+                "{host} should be accepted"
+            );
+        }
+        for host in [
+            "attacker.example:43180",
+            "localhost.attacker.example",
+            "10.0.0.5:43180",
+            "",
+        ] {
+            let raw = request(host);
+            assert!(
+                !request_host(&raw).is_some_and(is_loopback_host),
+                "{host} should be rejected"
+            );
+        }
+        assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
     }
 
     #[test]
