@@ -81,7 +81,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
         with:
           components: clippy, rustfmt
 
@@ -100,8 +100,8 @@ jobs:
       - name: Check daemon
         run: |
           cargo fmt -- --check
-          cargo test
-          cargo clippy -- -D warnings
+          cargo test --locked
+          cargo clippy --locked -- -D warnings
 
       - name: Validate compose
         run: docker compose -f docker-compose.example.yml config --quiet
@@ -144,8 +144,8 @@ jobs:
             -v "$HOME/.cargo:/cargo" \
             -v "$PWD:/src" \
             -w /src \
-            rust:1.95-bookworm \
-            cargo build --release
+            rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 \
+            cargo build --release --locked
           cp target/release/portless-daemon dist/portless-daemon
 
       - name: Set image tags

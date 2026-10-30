@@ -1,13 +1,16 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::RwLock,
 };
 use tracing::{debug, info, warn};
+
+// Idle or slow local connections must not hold UI tasks open indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="12" fill="#1f2933"/>
@@ -150,7 +153,10 @@ async fn serve_inner(addr: SocketAddr, state: UiState) -> Result<()> {
 
 async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
     let mut buf = [0_u8; 2048];
-    let n = stream.read(&mut buf).await.context("read request")?;
+    let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut buf))
+        .await
+        .context("read request timed out")?
+        .context("read request")?;
     let request = String::from_utf8_lossy(&buf[..n]);
     let path = request_path(&request);
 
