@@ -12,7 +12,8 @@ argon2 = "0.5"
 base64 = "0.22"
 futures-util = "0.3"
 getrandom = { version = "0.3", features = ["std"] }
-portless-contracts = { git = "https://github.com/CRBL-Technologies/portless-contracts", tag = "v1.0.3" }
+# TODO(release): switch to the v1.0.6 tag once portless-contracts publishes it.
+portless-contracts = { git = "https://github.com/CRBL-Technologies/portless-contracts", rev = "bf394a4bb4c3d3149fe0c44be897c722a7ce9ea7", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
