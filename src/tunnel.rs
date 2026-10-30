@@ -202,6 +202,8 @@ pub async fn run(
     let http = pms_http_client()?;
     let mut attempt = 0_u32;
     let mut force_identity_refresh = false;
+    // Consecutive relay revocations without a healthy session in between.
+    let mut revocations = 0_u32;
 
     loop {
         if force_identity_refresh
@@ -265,13 +267,18 @@ pub async fn run(
             Err(err) => {
                 if error_has_application_close(&err, STREAM_REVOKED) {
                     ui.set_status(DaemonStatus::DeviceRevoked).await;
+                    let delay = revoked_refresh_delay(revocations);
                     warn!(
                         error = %format!("{err:#}"),
                         relay = %remote.addr,
+                        revocations,
+                        delay_ms = delay.as_millis() as u64,
                         "relay rejected daemon certificate; refreshing identity"
                     );
+                    revocations = revocations.saturating_add(1);
                     force_identity_refresh = true;
                     attempt = 0;
+                    time::sleep(delay).await;
                     continue;
                 }
                 ui.set_status(DaemonStatus::RelayUnreachable).await;
@@ -344,10 +351,15 @@ pub async fn run(
                         Ok(status) => {
                             ui.set_status(status).await;
                             warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
+                            if session_started.elapsed() >= HEALTHY_SESSION_RESET {
+                                revocations = 0;
+                            }
                             if status == DaemonStatus::DeviceRevoked {
                                 force_identity_refresh = true;
                                 attempt = 0;
-                                Duration::ZERO
+                                let delay = revoked_refresh_delay(revocations);
+                                revocations = revocations.saturating_add(1);
+                                delay
                             } else if terminal_close_status(status) {
                                 attempt = 0;
                                 Duration::from_secs(60)
@@ -1588,6 +1600,16 @@ fn next_reconnect_attempt(session_duration: Duration, attempt: u32) -> u32 {
     }
 }
 
+/// The first revocation refreshes at once because the certificate may have
+/// been rotated. Repeated revocations back off: the relay keeps rejecting a
+/// blocked tunnel even after a successful identity refresh.
+fn revoked_refresh_delay(consecutive_revocations: u32) -> Duration {
+    match consecutive_revocations {
+        0 => Duration::ZERO,
+        n => reconnect_delay(n - 1),
+    }
+}
+
 fn reconnect_delay(attempt: u32) -> Duration {
     let base = Duration::from_secs(1);
     let multiplier = 1_u32 << attempt.min(5);
@@ -2686,6 +2708,14 @@ mod tests {
         assert_eq!(micros_to_millis(999), 0);
         assert_eq!(micros_to_millis(1000), 1);
         assert_eq!(micros_to_millis(1500), 1);
+    }
+
+    #[test]
+    fn repeated_revocations_back_off_after_one_immediate_refresh() {
+        assert_eq!(revoked_refresh_delay(0), Duration::ZERO);
+        assert!(revoked_refresh_delay(1) >= Duration::from_secs(1));
+        assert!(revoked_refresh_delay(3) >= Duration::from_secs(4));
+        assert!(revoked_refresh_delay(40) < Duration::from_secs(16));
     }
 
     #[test]
