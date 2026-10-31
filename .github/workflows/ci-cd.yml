@@ -107,7 +107,7 @@ jobs:
         run: docker compose -f docker-compose.example.yml config --quiet
 
       - name: Test deployment verification
-        run: bash .github/scripts/deploy-client-stacks.test.sh
+        run: bash deploy/scripts/deploy-client-stacks.test.sh
 
   docker:
     name: Build Daemon Image

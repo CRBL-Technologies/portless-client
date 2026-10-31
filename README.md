@@ -67,12 +67,23 @@ Optional stack environment:
   `127.0.0.1:43180`.
 
 Both `main` and `dev` publish without deployment. The existing
-`.github/scripts/deploy-client-stacks.sh` remains an explicitly invoked operator
+`deploy/scripts/deploy-client-stacks.sh` remains an explicitly invoked operator
 tool. Its production path requires `PORTLESS_CLIENT_DEPLOY_TARGET=production`
 and `PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full commit SHA>`.
-Operators must resolve and authorize the target before running it. Do not
+Operators must resolve and authorize the target before running it. NAS deployments
+and redeployments require explicit authorization. Do not
 activate a retired staging target merely because its code path still exists.
 Mutable `prod`/`latest` tags are not accepted by the production deployment tool.
+
+The tool uses `PORTLESS_CLIENT_NAS_REGISTRY_ID` to select registry credentials
+already stored in the target Portainer instance. The primary staging target
+also requires `PORTLESS_CLIENT_REGISTRY_ID`. Both IDs must be positive integers.
+The tool does not send local `GHCR_USERNAME` or `GHCR_TOKEN` values to Portainer.
+
+Set `PORTLESS_DEPLOY_PROXY` only when an HTTP proxy is needed to reach the
+target. Cloudflare Access headers are optional. The tool sends them only when
+both `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are set. It removes
+temporary deployment files when it exits, including after a failed rollout.
 
 ## Network Boundary And Firewall Recommendations
 

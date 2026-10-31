@@ -1,12 +1,32 @@
 #!/usr/bin/env bash
+# Manual rollout of the operator-managed client stacks. CI only publishes images.
+# Obtain explicit authorization before deploying or redeploying a NAS target.
+# Do not activate retired staging targets without a separate lifecycle review.
+#
+# Usage:
+#   PORTLESS_CLIENT_DEPLOY_TARGET=production \
+#   PORTLESS_CLIENT_DEPLOY_IMAGE=ghcr.io/crbl-technologies/portless-client:sha-<full sha> \
+#   bash deploy/scripts/deploy-client-stacks.sh
+#
+# Required target settings:
+#   PORTLESS_CLIENT_NAS_DEPLOY_API_URL, PORTLESS_CLIENT_NAS_DEPLOY_API_KEY,
+#   PORTLESS_CLIENT_NAS_STACK_ID, PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID,
+#   PORTLESS_CLIENT_NAS_REGISTRY_ID
+# Staging also requires the primary target settings and PORTLESS_CLIENT_REGISTRY_ID.
+# Registry IDs select credentials already stored in the target Portainer instance.
+# Never supply local registry credentials to Portainer.
+# Optional connection settings:
+#   PORTLESS_DEPLOY_PROXY          HTTP proxy that can reach the target
+#   CF_ACCESS_CLIENT_ID/SECRET     sent only when both are set
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 require_vars() {
   local missing=0
   local name
   for name in "$@"; do
     if [ -z "${!name:-}" ]; then
-      echo "::error title=Deploy variable missing::Missing ${name}"
+      echo "error: Missing ${name}"
       missing=1
     fi
   done
@@ -17,9 +37,18 @@ urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
 }
 
+validate_registry_id() {
+  local target_name="$1"
+  local registry_id="$2"
+  if [[ ! "$registry_id" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: ${target_name} registry ID must be a positive integer"
+    return 1
+  fi
+}
+
 stack_file="$(cat docker-compose.deploy.yml)"
-repo_lc="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
-deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME}}"
+repo_lc="$(echo "${GITHUB_REPOSITORY:-CRBL-Technologies/portless-client}" | tr '[:upper:]' '[:lower:]')"
+deploy_target="${PORTLESS_CLIENT_DEPLOY_TARGET:-${GITHUB_REF_NAME:-}}"
 
 if [ "$deploy_target" = "main" ] || [ "$deploy_target" = "production" ]; then
   require_vars PORTLESS_CLIENT_DEPLOY_IMAGE
@@ -30,7 +59,7 @@ elif [ "$deploy_target" = "dev" ] || [ "$deploy_target" = "staging" ]; then
   nas_target_name="staging-nas"
   deploy_primary_staging=1
 else
-  echo "::error title=Deploy target invalid::Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
+  echo "error: Unsupported PORTLESS_CLIENT_DEPLOY_TARGET/GITHUB_REF_NAME: ${deploy_target}"
   exit 1
 fi
 
@@ -39,7 +68,7 @@ if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
   image_sha="${PORTLESS_CLIENT_DEPLOY_IMAGE#"$image_prefix"}"
   if [ "$PORTLESS_CLIENT_DEPLOY_IMAGE" != "${image_prefix}${image_sha}" ] ||
     [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "::error title=Invalid client image::Select a portless-client image tagged with a full commit SHA"
+    echo "error: Select a portless-client image tagged with a full commit SHA"
     exit 1
   fi
 fi
@@ -50,23 +79,26 @@ deploy_stack() {
   local api_key="$3"
   local stack_id="$4"
   local endpoint_id_fallback="$5"
-
-  require_vars CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET GHCR_USERNAME GHCR_TOKEN
+  local registry_id="$6"
 
   if [ -z "$api_url" ] || [ -z "$api_key" ] || [ -z "$stack_id" ]; then
-    echo "::error title=Deploy target incomplete::${target_name} is missing URL, API key, or stack ID"
+    echo "error: ${target_name} is missing URL, API key, or stack ID"
     exit 1
   fi
 
   local api="${api_url%/}/api"
-  local auth_headers=(-A "crbl-ops/1.0" \
-    -H "X-API-Key: ${api_key}" \
-    -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
-    -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+  local auth_headers=(-A "crbl-ops/1.0" -H "X-API-Key: ${api_key}")
+  if [ -n "${PORTLESS_DEPLOY_PROXY:-}" ]; then
+    auth_headers+=(-x "${PORTLESS_DEPLOY_PROXY}")
+  fi
+  if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+    auth_headers+=(-H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+      -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}")
+  fi
 
   local stack_resp
   if ! stack_resp="$(curl -sf --max-time 30 "${auth_headers[@]}" "$api/stacks/${stack_id}")"; then
-    echo "::error title=Deploy stack fetch failed::${target_name} stack ${stack_id} could not be fetched"
+    echo "error: ${target_name} stack ${stack_id} could not be fetched"
     exit 1
   fi
 
@@ -78,12 +110,19 @@ deploy_stack() {
     stack_endpoint_id="$endpoint_id_fallback"
   fi
   if [ -z "$stack_endpoint_id" ]; then
-    echo "::error title=Deploy endpoint missing::${target_name} stack ${stack_id} did not include EndpointId"
+    echo "error: ${target_name} stack ${stack_id} did not include EndpointId"
     exit 1
   fi
 
   local env_json
   env_json="$(echo "$stack_resp" | jq -c '[.Env[]? | {name: .name, value: .value}]')"
+
+  local saved_stack
+  if ! saved_stack="$(curl -sf --max-time 30 "${auth_headers[@]}" \
+    "$api/stacks/${stack_id}/file?endpointId=${stack_endpoint_id}")"; then
+    echo "error: ${target_name} saved stack definition could not be fetched" >&2
+    exit 1
+  fi
 
   current_env_value() {
     local name="$1"
@@ -94,6 +133,10 @@ deploy_stack() {
   if [ -n "${PORTLESS_CLIENT_DEPLOY_IMAGE:-}" ]; then
     client_image="$PORTLESS_CLIENT_DEPLOY_IMAGE"
   elif [ "${DAEMON_CHANGED:-false}" = "true" ]; then
+    if [ -z "${GITHUB_SHA:-}" ]; then
+      echo "error: DAEMON_CHANGED=true needs GITHUB_SHA, or pass PORTLESS_CLIENT_DEPLOY_IMAGE"
+      exit 1
+    fi
     client_image="ghcr.io/${repo_lc}:sha-${GITHUB_SHA}"
   else
     client_image="$(current_env_value PORTLESS_CLIENT_IMAGE)"
@@ -144,17 +187,27 @@ deploy_stack() {
   fi
 
   local env_file payload_file
-  env_file="$(mktemp)"
-  payload_file="$(mktemp)"
+  env_file="$temp_dir/env.json"
+  payload_file="$temp_dir/payload.json"
   printf '%s' "$env_json" > "$env_file"
   local expected_config_hash
-  expected_config_hash="$(python3 - "$env_file" "$stack_name" <<'PY'
+  expected_config_hash="$(python3 - "$env_file" "$stack_name" 3<<<"$saved_stack" <<'PY'
 import json, os, subprocess, sys
 try:
     with open(sys.argv[1]) as source:
         values = json.load(source)
     env = {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
     env.update({entry["name"]: entry["value"] or "" for entry in values})
+    with os.fdopen(3) as source:
+        saved_compose = json.load(source)["StackFileContent"]
+    saved = subprocess.run(
+        ["docker", "compose", "--env-file", "/dev/null", "--project-name", sys.argv[2],
+         "-f", "-", "config", "--format", "json"],
+        input=saved_compose, env=env, text=True, capture_output=True, check=True,
+    )
+    daemon = json.loads(saved.stdout)["services"]["portless-daemon"]
+    if daemon.get("entrypoint") is not None:
+        sys.exit("error: Saved client stack overrides the daemon entrypoint; use its dedicated deployment tool")
     result = subprocess.run(
         ["docker", "compose", "--env-file", "/dev/null", "--project-name", sys.argv[2],
          "-f", "docker-compose.deploy.yml", "config", "--hash", "portless-daemon"],
@@ -162,7 +215,7 @@ try:
     )
     print(dict(line.split() for line in result.stdout.splitlines())["portless-daemon"])
 except Exception:
-    sys.exit("Could not calculate the intended client configuration; deployment aborted")
+    sys.exit("error: Could not verify the saved client stack or calculate its intended configuration; deployment aborted")
 PY
   )"
   jq -n --arg file "$stack_file" --slurpfile env "$env_file" \
@@ -174,22 +227,19 @@ PY
     local tag="${image##*:}"
     local registry_auth
     local pull_response
-    pull_response="$(mktemp)"
+    pull_response="$temp_dir/pull-response.json"
     registry_auth="$(jq -nc \
-      --arg username "$GHCR_USERNAME" \
-      --arg password "$GHCR_TOKEN" \
-      '{"username":$username,"password":$password,"serveraddress":"ghcr.io"}' | base64 -w0)"
+      --argjson registry_id "$registry_id" \
+      '{registryId:$registry_id}' | base64 -w0)"
     curl -sf --max-time 300 -X POST \
       "${auth_headers[@]}" \
       -H "X-Registry-Auth: ${registry_auth}" \
       -o "$pull_response" \
       "$api/endpoints/${stack_endpoint_id}/docker/images/create?fromImage=$(urlencode "$repo")&tag=$(urlencode "$tag")"
     if ! jq -se 'length > 0 and all(.[]; .error == null and .errorDetail == null)' "$pull_response" >/dev/null; then
-      rm -f "$pull_response"
-      echo "::error title=Image pull failed::Registry did not confirm the requested client image" >&2
+      echo "error: Registry did not confirm the requested client image" >&2
       return 1
     fi
-    rm -f "$pull_response"
   }
 
   local endpoint_ready=0
@@ -205,7 +255,7 @@ PY
     echo "${target_name} endpoint warmup ${i}/10 returned HTTP ${status}"
   done
   if [ "$endpoint_ready" -ne 1 ]; then
-    echo "::error title=Deploy endpoint unavailable::${target_name} endpoint ${stack_endpoint_id} did not become ready"
+    echo "error: ${target_name} endpoint ${stack_endpoint_id} did not become ready"
     exit 1
   fi
 
@@ -214,7 +264,7 @@ PY
   image_json="$(curl -sf --max-time 30 "${auth_headers[@]}" \
     "$api/endpoints/$stack_endpoint_id/docker/images/$client_image/json")"
   if ! jq -e '.Config.Healthcheck.Test == ["CMD", "/usr/local/bin/portless-daemon", "healthcheck"]' <<< "$image_json" >/dev/null; then
-    echo "::error title=Client image upgrade required::Select a healthcheck-enabled client image before updating this stack" >&2
+    echo "error: Select a healthcheck-enabled client image before updating this stack" >&2
     exit 1
   fi
   expected_image_id="$(jq -er '.Id' <<< "$image_json")"
@@ -225,7 +275,7 @@ PY
     -o /dev/null \
     -d @"$payload_file" \
     "$api/stacks/${stack_id}?endpointId=${stack_endpoint_id}"; then
-    echo "::error title=Deploy stack update failed::${target_name} stack ${stack_id} update failed"
+    echo "error: ${target_name} stack ${stack_id} update failed"
     exit 1
   fi
 
@@ -244,7 +294,7 @@ PY
     sleep 3
   done
   if [ "$verified" -ne 1 ]; then
-    echo "::error title=Deploy verification failed::${target_name} stored stack file did not match repository compose file within the verification window"
+    echo "error: ${target_name} stored stack file did not match repository compose file within the verification window"
     exit 1
   fi
 
@@ -266,35 +316,52 @@ PY
     [ "$i" -eq 36 ] || sleep 5
   done
   if [ "$verified" -ne 1 ]; then
-    echo "::error title=Deploy verification failed::${target_name} client did not become healthy with the requested image"
+    echo "error: ${target_name} client did not become healthy with the requested image"
     exit 1
   fi
 
   echo "Deployed ${target_name} stack ${stack_id} on endpoint ${stack_endpoint_id} with image ${client_image}"
-  rm -f "$env_file" "$payload_file"
 }
 
 if [ "$deploy_primary_staging" -eq 1 ]; then
   require_vars \
     PORTLESS_CLIENT_DEPLOY_API_URL \
     PORTLESS_CLIENT_DEPLOY_API_KEY \
-    PORTLESS_CLIENT_STACK_ID
-  deploy_stack \
-    "staging-primary" \
-    "$PORTLESS_CLIENT_DEPLOY_API_URL" \
-    "$PORTLESS_CLIENT_DEPLOY_API_KEY" \
-    "$PORTLESS_CLIENT_STACK_ID" \
-    "${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}"
+    PORTLESS_CLIENT_STACK_ID \
+    PORTLESS_CLIENT_REGISTRY_ID
 fi
 
 require_vars \
   PORTLESS_CLIENT_NAS_DEPLOY_API_URL \
   PORTLESS_CLIENT_NAS_DEPLOY_API_KEY \
   PORTLESS_CLIENT_NAS_STACK_ID \
-  PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID
+  PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID \
+  PORTLESS_CLIENT_NAS_REGISTRY_ID
+
+if [ "$deploy_primary_staging" -eq 1 ]; then
+  validate_registry_id "staging-primary" "$PORTLESS_CLIENT_REGISTRY_ID"
+fi
+validate_registry_id "$nas_target_name" "$PORTLESS_CLIENT_NAS_REGISTRY_ID"
+
+umask 077
+temp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$temp_dir"' EXIT
+chmod 700 "$temp_dir"
+
+if [ "$deploy_primary_staging" -eq 1 ]; then
+  deploy_stack \
+    "staging-primary" \
+    "$PORTLESS_CLIENT_DEPLOY_API_URL" \
+    "$PORTLESS_CLIENT_DEPLOY_API_KEY" \
+    "$PORTLESS_CLIENT_STACK_ID" \
+    "${PORTLESS_CLIENT_DEPLOY_ENDPOINT_ID:-}" \
+    "$PORTLESS_CLIENT_REGISTRY_ID"
+fi
+
 deploy_stack \
   "$nas_target_name" \
   "$PORTLESS_CLIENT_NAS_DEPLOY_API_URL" \
   "$PORTLESS_CLIENT_NAS_DEPLOY_API_KEY" \
   "$PORTLESS_CLIENT_NAS_STACK_ID" \
-  "$PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID"
+  "$PORTLESS_CLIENT_NAS_DEPLOY_ENDPOINT_ID" \
+  "$PORTLESS_CLIENT_NAS_REGISTRY_ID"
