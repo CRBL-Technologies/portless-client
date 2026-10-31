@@ -299,13 +299,13 @@ pub async fn run(
                     if let Some(renewal) = renewal_attempt.take() {
                         renewal.abort();
                     }
+                    if session_started.elapsed() >= HEALTHY_SESSION_RESET {
+                        revocations = 0;
+                    }
                     break match result {
                         Ok(status) => {
                             ui.set_status(status).await;
                             warn!(relay = %remote.addr, status = ?status, "relay QUIC tunnel closed");
-                            if session_started.elapsed() >= HEALTHY_SESSION_RESET {
-                                revocations = 0;
-                            }
                             if status == DaemonStatus::DeviceRevoked {
                                 force_identity_refresh = true;
                                 attempt = 0;

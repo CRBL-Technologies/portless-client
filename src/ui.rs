@@ -154,10 +154,24 @@ async fn serve_inner(addr: SocketAddr, state: UiState) -> Result<()> {
 
 async fn handle(mut stream: TcpStream, state: UiState, loopback_only: bool) -> Result<()> {
     let mut buf = [0_u8; 2048];
-    let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut buf))
-        .await
-        .context("read request timed out")?
-        .context("read request")?;
+    let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
+        let mut n = 0;
+        loop {
+            if n == buf.len() {
+                anyhow::bail!("request headers exceed read limit");
+            }
+            let read = stream.read(&mut buf[n..]).await.context("read request")?;
+            if read == 0 {
+                anyhow::bail!("request headers are incomplete");
+            }
+            n += read;
+            if let Some(end) = buf[..n].windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                return Ok::<usize, anyhow::Error>(end + 4);
+            }
+        }
+    })
+    .await
+    .context("read request timed out")??;
     let request = String::from_utf8_lossy(&buf[..n]);
     // A loopback-only UI must not answer pages that reached it through DNS
     // rebinding, where the browser sends the attacker's host name.
@@ -715,6 +729,89 @@ mod tests {
             );
         }
         assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    async fn local_ui_connection() -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let state = UiState {
+            inner: Arc::new(RwLock::new(UiSnapshot {
+                status: DaemonStatus::Starting,
+                connection: None,
+                pms_url: String::new(),
+                control_url: String::new(),
+                data_dir: String::new(),
+                ui_addr: String::new(),
+                keepalive_profile: String::new(),
+                tunnel_id: None,
+                subdomain: None,
+                relay_address: None,
+                config_generation: None,
+                public_url: None,
+            })),
+        };
+        (client, tokio::spawn(handle(server, state, true)))
+    }
+
+    #[tokio::test]
+    async fn ui_waits_for_complete_host_headers() {
+        for (prefix, suffix, status) in [
+            (
+                "GET /healthz HTTP/1.1\r\n",
+                "Host: localhost\r\n\r\n",
+                "200 OK",
+            ),
+            (
+                "GET /healthz HTTP/1.1\r\nHost: localhost",
+                ".attacker.test:43180\r\n\r\n",
+                "403 Forbidden",
+            ),
+        ] {
+            let (mut client, server) = local_ui_connection().await;
+            client.write_all(prefix.as_bytes()).await.unwrap();
+            let mut byte = [0];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                    .await
+                    .is_err(),
+                "UI responded before receiving the complete Host header"
+            );
+            client.write_all(suffix.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                "{response}"
+            );
+            server.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_rejects_headers_truncated_at_the_read_limit() {
+        let (mut client, server) = local_ui_connection().await;
+        let prefix = format!(
+            "GET /status.json?{} HTTP/1.1\r\nHost: localhost",
+            "a".repeat(2005)
+        );
+        assert_eq!(prefix.len(), 2048);
+        client.write_all(prefix.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.is_empty(),
+            "UI served an incomplete request: {response}"
+        );
+        assert!(server.await.unwrap().is_err());
     }
 
     #[test]
