@@ -5,6 +5,9 @@ on:
     branches: [main, dev]
   push:
     branches: [dev, main]
+  schedule:
+    # Weekly, so advisories published between pushes still surface.
+    - cron: "41 4 * * 1"
   workflow_dispatch:
 
 permissions:
