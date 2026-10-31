@@ -44,7 +44,8 @@ Open `http://127.0.0.1:43180/` for local daemon status.
 `docker-compose.deploy.yml` is the existing operator-managed stack template.
 The stack owns customer-specific settings, including `PORTLESS_DEVICE_TOKEN`.
 CI builds and publishes images only; it never updates a stack or dispatches a
-deployment. The public daemon does not require 1Password.
+deployment. The daemon reads ordinary environment variables; deployment-specific
+secret loading stays outside this repository and its public image.
 
 Managed stacks run the daemon on Docker bridge networking and map
 `host.docker.internal` to the Docker host gateway. When Plex Media Server runs on
