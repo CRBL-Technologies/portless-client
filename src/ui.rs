@@ -481,7 +481,7 @@ fn status_label(status: DaemonStatus) -> &'static str {
         DaemonStatus::Reconnecting => "Reconnecting",
         DaemonStatus::AuthFailed => "Auth failed",
         DaemonStatus::CapReached => "Capacity reached",
-        DaemonStatus::DeviceRevoked => "Device revoked",
+        DaemonStatus::DeviceRevoked => "Access denied",
         DaemonStatus::HomeUnreachable => "Home unreachable",
         DaemonStatus::PlexUnreachable => "Plex unreachable",
         DaemonStatus::RelayUnreachable => "Relay unreachable",
@@ -500,7 +500,7 @@ fn status_help(status: DaemonStatus) -> &'static str {
             "Capacity reached. Wait for quota reset or manage billing in the hosted dashboard."
         }
         DaemonStatus::DeviceRevoked => {
-            "Device revoked. Rotate the daemon token in the hosted dashboard and restart this daemon with the new token."
+            "Access denied. If the tunnel is blocked, ask the operator to unblock it. Replace the daemon token only if it was revoked."
         }
         DaemonStatus::HomeUnreachable => {
             "Home network unreachable. Check that this container can reach your LAN and DNS."
@@ -633,6 +633,29 @@ mod tests {
         assert!(html.contains("Plex server"));
         assert!(html.contains("Portless control URL"));
         assert!(!html.contains("Control status"));
+    }
+
+    #[test]
+    fn dashboard_explains_blocked_and_revoked_access() {
+        let html = render_html(&UiSnapshot {
+            status: DaemonStatus::DeviceRevoked,
+            connection: None,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://connect.example.test/".to_owned(),
+            data_dir: "/data".to_owned(),
+            ui_addr: "127.0.0.1:43180".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: None,
+            subdomain: None,
+            relay_address: None,
+            config_generation: None,
+            public_url: None,
+        });
+
+        assert!(html.contains("Access denied"));
+        assert!(html.contains("If the tunnel is blocked, ask the operator to unblock it."));
+        assert!(html.contains("Replace the daemon token only if it was revoked."));
+        assert!(!html.contains("Device revoked. Rotate the daemon token"));
     }
 
     #[test]
