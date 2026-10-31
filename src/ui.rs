@@ -1,13 +1,16 @@
 use crate::{config::Config, control::DeviceConfig};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::RwLock,
 };
 use tracing::{debug, info, warn};
+
+// Idle or slow local connections must not hold UI tasks open indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="12" fill="#1f2933"/>
@@ -140,18 +143,47 @@ async fn serve_inner(addr: SocketAddr, state: UiState) -> Result<()> {
             .await
             .context("accept client UI request")?;
         let state = state.clone();
+        let loopback_only = addr.ip().is_loopback();
         tokio::spawn(async move {
-            if let Err(err) = handle(stream, state).await {
+            if let Err(err) = handle(stream, state, loopback_only).await {
                 debug!(%peer, error = %err, "client UI request failed");
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, state: UiState) -> Result<()> {
+async fn handle(mut stream: TcpStream, state: UiState, loopback_only: bool) -> Result<()> {
     let mut buf = [0_u8; 2048];
-    let n = stream.read(&mut buf).await.context("read request")?;
+    let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
+        let mut n = 0;
+        loop {
+            if n == buf.len() {
+                anyhow::bail!("request headers exceed read limit");
+            }
+            let read = stream.read(&mut buf[n..]).await.context("read request")?;
+            if read == 0 {
+                anyhow::bail!("request headers are incomplete");
+            }
+            n += read;
+            if let Some(end) = buf[..n].windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                return Ok::<usize, anyhow::Error>(end + 4);
+            }
+        }
+    })
+    .await
+    .context("read request timed out")??;
     let request = String::from_utf8_lossy(&buf[..n]);
+    // A loopback-only UI must not answer pages that reached it through DNS
+    // rebinding, where the browser sends the attacker's host name.
+    if loopback_only && !request_host(&request).is_some_and(is_loopback_host) {
+        return write_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "forbidden host\n",
+        )
+        .await;
+    }
     let path = request_path(&request);
 
     match path {
@@ -196,6 +228,26 @@ fn request_path(request: &str) -> &str {
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
     path.split_once('?').map_or(path, |(path, _)| path)
+}
+
+fn request_host(request: &str) -> Option<&str> {
+    request.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim())
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(name, _)| name),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn write_response(
@@ -429,7 +481,7 @@ fn status_label(status: DaemonStatus) -> &'static str {
         DaemonStatus::Reconnecting => "Reconnecting",
         DaemonStatus::AuthFailed => "Auth failed",
         DaemonStatus::CapReached => "Capacity reached",
-        DaemonStatus::DeviceRevoked => "Device revoked",
+        DaemonStatus::DeviceRevoked => "Access denied",
         DaemonStatus::HomeUnreachable => "Home unreachable",
         DaemonStatus::PlexUnreachable => "Plex unreachable",
         DaemonStatus::RelayUnreachable => "Relay unreachable",
@@ -448,7 +500,7 @@ fn status_help(status: DaemonStatus) -> &'static str {
             "Capacity reached. Wait for quota reset or manage billing in the hosted dashboard."
         }
         DaemonStatus::DeviceRevoked => {
-            "Device revoked. Rotate the daemon token in the hosted dashboard and restart this daemon with the new token."
+            "Access denied. If the tunnel is blocked, ask the operator to unblock it. Replace the daemon token only if it was revoked."
         }
         DaemonStatus::HomeUnreachable => {
             "Home network unreachable. Check that this container can reach your LAN and DNS."
@@ -584,6 +636,29 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_explains_blocked_and_revoked_access() {
+        let html = render_html(&UiSnapshot {
+            status: DaemonStatus::DeviceRevoked,
+            connection: None,
+            pms_url: "http://plex:32400/".to_owned(),
+            control_url: "https://connect.example.test/".to_owned(),
+            data_dir: "/data".to_owned(),
+            ui_addr: "127.0.0.1:43180".to_owned(),
+            keepalive_profile: "residential".to_owned(),
+            tunnel_id: None,
+            subdomain: None,
+            relay_address: None,
+            config_generation: None,
+            public_url: None,
+        });
+
+        assert!(html.contains("Access denied"));
+        assert!(html.contains("If the tunnel is blocked, ask the operator to unblock it."));
+        assert!(html.contains("Replace the daemon token only if it was revoked."));
+        assert!(!html.contains("Device revoked. Rotate the daemon token"));
+    }
+
+    #[test]
     fn dashboard_url_is_derived_from_control_url() {
         assert_eq!(
             dashboard_url("https://connect.portless.io/"),
@@ -646,6 +721,120 @@ mod tests {
             .contains(r#"<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=20260428">"#));
         assert!(FAVICON_SVG.contains(r##"fill="#1f2933""##));
         assert!(FAVICON_SVG.contains(r##"stroke="#b7791f""##));
+    }
+
+    #[test]
+    fn loopback_host_check_rejects_rebound_names() {
+        let request = |host: &str| format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        for host in [
+            "127.0.0.1:43180",
+            "localhost:43180",
+            "LOCALHOST",
+            "[::1]:43180",
+            "127.0.0.2",
+        ] {
+            let raw = request(host);
+            assert!(
+                request_host(&raw).is_some_and(is_loopback_host),
+                "{host} should be accepted"
+            );
+        }
+        for host in [
+            "attacker.example:43180",
+            "localhost.attacker.example",
+            "10.0.0.5:43180",
+            "",
+        ] {
+            let raw = request(host);
+            assert!(
+                !request_host(&raw).is_some_and(is_loopback_host),
+                "{host} should be rejected"
+            );
+        }
+        assert_eq!(request_host("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    async fn local_ui_connection() -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let state = UiState {
+            inner: Arc::new(RwLock::new(UiSnapshot {
+                status: DaemonStatus::Starting,
+                connection: None,
+                pms_url: String::new(),
+                control_url: String::new(),
+                data_dir: String::new(),
+                ui_addr: String::new(),
+                keepalive_profile: String::new(),
+                tunnel_id: None,
+                subdomain: None,
+                relay_address: None,
+                config_generation: None,
+                public_url: None,
+            })),
+        };
+        (client, tokio::spawn(handle(server, state, true)))
+    }
+
+    #[tokio::test]
+    async fn ui_waits_for_complete_host_headers() {
+        for (prefix, suffix, status) in [
+            (
+                "GET /healthz HTTP/1.1\r\n",
+                "Host: localhost\r\n\r\n",
+                "200 OK",
+            ),
+            (
+                "GET /healthz HTTP/1.1\r\nHost: localhost",
+                ".attacker.test:43180\r\n\r\n",
+                "403 Forbidden",
+            ),
+        ] {
+            let (mut client, server) = local_ui_connection().await;
+            client.write_all(prefix.as_bytes()).await.unwrap();
+            let mut byte = [0];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                    .await
+                    .is_err(),
+                "UI responded before receiving the complete Host header"
+            );
+            client.write_all(suffix.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                "{response}"
+            );
+            server.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_rejects_headers_truncated_at_the_read_limit() {
+        let (mut client, server) = local_ui_connection().await;
+        let prefix = format!(
+            "GET /status.json?{} HTTP/1.1\r\nHost: localhost",
+            "a".repeat(2005)
+        );
+        assert_eq!(prefix.len(), 2048);
+        client.write_all(prefix.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.is_empty(),
+            "UI served an incomplete request: {response}"
+        );
+        assert!(server.await.unwrap().is_err());
     }
 
     #[test]

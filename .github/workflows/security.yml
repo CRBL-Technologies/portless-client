@@ -5,6 +5,9 @@ on:
     branches: [main, dev]
   push:
     branches: [dev, main]
+  schedule:
+    # Weekly, so advisories published between pushes still surface.
+    - cron: "41 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
 
       - name: Cache cargo-deny
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
