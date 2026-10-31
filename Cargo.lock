@@ -1139,7 +1139,7 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 [[package]]
 name = "portless-contracts"
 version = "1.0.5"
-source = "git+https://github.com/CRBL-Technologies/portless-contracts?rev=bf394a4bb4c3d3149fe0c44be897c722a7ce9ea7#bf394a4bb4c3d3149fe0c44be897c722a7ce9ea7"
+source = "git+https://github.com/CRBL-Technologies/portless-contracts?tag=v1.0.6#34e4ff578cb789d1bfb2b078bef52f3f45dd88c0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
