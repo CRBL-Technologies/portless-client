@@ -33,7 +33,7 @@ use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
 use reqwest::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
     redirect::Policy,
-    Client, Method, Url,
+    Client, Method, StatusCode, Url,
 };
 use rustls::{
     pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
@@ -175,7 +175,7 @@ pub async fn run(
                     force_identity_refresh = false;
                 }
                 Err(err) => {
-                    ui.set_status(DaemonStatus::RelayUnreachable).await;
+                    ui.set_status(identity_refresh_failure_status(&err)).await;
                     warn!(
                         error = %format!("{err:#}"),
                         attempt,
@@ -785,6 +785,20 @@ fn next_reconnect_attempt(session_duration: Duration, attempt: u32) -> u32 {
     }
 }
 
+/// Control rejecting the device token (401) or the device (403, which also
+/// covers a blocked tunnel) is not a connectivity problem; say so in the UI.
+fn identity_refresh_failure_status(err: &anyhow::Error) -> DaemonStatus {
+    let status = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .and_then(reqwest::Error::status);
+    match status {
+        Some(StatusCode::UNAUTHORIZED) => DaemonStatus::AuthFailed,
+        Some(StatusCode::FORBIDDEN) => DaemonStatus::DeviceRevoked,
+        _ => DaemonStatus::RelayUnreachable,
+    }
+}
+
 /// The first revocation refreshes at once because the certificate may have
 /// been rotated. Repeated revocations back off: the relay keeps rejecting a
 /// blocked tunnel even after a successful identity refresh.
@@ -1385,6 +1399,54 @@ mod tests {
         assert!(revoked_refresh_delay(1) >= Duration::from_secs(1));
         assert!(revoked_refresh_delay(3) >= Duration::from_secs(4));
         assert!(revoked_refresh_delay(40) < Duration::from_secs(16));
+    }
+
+    #[tokio::test]
+    async fn identity_refresh_failures_report_control_rejections() {
+        use tokio::io::AsyncReadExt as _;
+
+        for (response, expected) in [
+            ("401 Unauthorized", DaemonStatus::AuthFailed),
+            ("403 Forbidden", DaemonStatus::DeviceRevoked),
+            ("503 Service Unavailable", DaemonStatus::RelayUnreachable),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/v1/device/certificates",
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                let reply = format!(
+                    "HTTP/1.1 {response}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let err = Client::new()
+                .post(url)
+                .send()
+                .await
+                .context("request device certificate")
+                .and_then(|reply| {
+                    reply
+                        .error_for_status()
+                        .context("certificate response status")
+                })
+                .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(
+                identity_refresh_failure_status(&err),
+                expected,
+                "{response}"
+            );
+        }
+        let unreachable = anyhow!("connect relay");
+        assert_eq!(
+            identity_refresh_failure_status(&unreachable),
+            DaemonStatus::RelayUnreachable
+        );
     }
 
     #[test]
