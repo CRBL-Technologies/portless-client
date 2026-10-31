@@ -1,4 +1,5 @@
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+LABEL org.opencontainers.image.source="https://github.com/CRBL-Technologies/portless-client"
 
 RUN useradd --system --uid 10001 --home /var/lib/portless portless \
   && mkdir -p /var/lib/portless \
