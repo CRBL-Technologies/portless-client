@@ -1,11 +1,17 @@
 name: Client CI/CD
 
+# A push to dev starts nothing. Verify on the VM before you push. For a dev image,
+# start this workflow by hand: gh workflow run ci-cd.yml --ref dev
 on:
   pull_request:
-    branches: [main, dev]
+    branches: [main]
   push:
-    branches: [dev, main]
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

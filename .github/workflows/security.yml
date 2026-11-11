@@ -1,14 +1,19 @@
 name: Security
 
+# A push to dev starts nothing. The pull request into main and a manual run cover dev.
 on:
   pull_request:
-    branches: [main, dev]
+    branches: [main]
   push:
-    branches: [dev, main]
+    branches: [main]
   schedule:
     # Weekly, so advisories published between pushes still surface.
     - cron: "41 4 * * 1"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
